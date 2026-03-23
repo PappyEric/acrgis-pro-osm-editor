@@ -7,13 +7,13 @@ import urllib.error
 import base64
 import os
 import json
+from xml.sax.saxutils import escape
 
 # --- Configuration ---
-# You can store your OSM credentials here to avoid entering them each time.
-# WARNING: Keep your password safe. Do not commit this file to public repositories
-# if it contains real passwords.
-OSM_USERNAME = "eric.d.meadows@pm.me"
-OSM_PASSWORD = "1W34s3l_gis"
+# OpenStreetMap now requires OAuth 2.0 Personal Access Tokens for API edits.
+# You can generate one from your OSM Account Settings -> OAuth 2 applications -> Personal Access Tokens.
+# Check the boxes for "modify the map" and paste the generated string here:
+OSM_BEARER_TOKEN = "your_personal_access_token_here"
 
 # OSM API Endpoints
 OVERPASS_ENDPOINTS = [
@@ -22,11 +22,6 @@ OVERPASS_ENDPOINTS = [
     "https://z.overpass-api.de/api/interpreter"
 ]
 OSM_API_URL = "https://api.openstreetmap.org/api/0.6/"
-
-def get_basic_auth_header():
-    credentials = f"{OSM_USERNAME}:{OSM_PASSWORD}"
-    encoded = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
-    return f"Basic {encoded}"
 
 
 class Toolbox(object):
@@ -237,6 +232,7 @@ out meta qt;"""
         pt_fc = os.path.join(out_gdb, "OSM_Points")
         ln_fc = os.path.join(out_gdb, "OSM_Lines")
         py_fc = os.path.join(out_gdb, "OSM_Polygons")
+        top_fc = os.path.join(out_gdb, "OSM_Topology_Nodes")
         
         def create_fc(fc, geom_type):
             if not arcpy.Exists(fc):
@@ -252,6 +248,10 @@ out meta qt;"""
         create_fc(ln_fc, "POLYLINE")
         create_fc(py_fc, "POLYGON")
         
+        if not arcpy.Exists(top_fc):
+            arcpy.management.CreateFeatureclass(out_gdb, "OSM_Topology_Nodes", "POINT", spatial_reference=sr_wgs84)
+            arcpy.management.AddField(top_fc, "osm_id", "TEXT", field_length=25)
+        
         # Anti-Duplication: Get existing osm_ids already in the geodatabase
         def get_existing_ids(fc):
             ids = set()
@@ -265,8 +265,23 @@ out meta qt;"""
         existing_pts = get_existing_ids(pt_fc)
         existing_lns = get_existing_ids(ln_fc)
         existing_pys = get_existing_ids(py_fc)
+        existing_top = get_existing_ids(top_fc)
         
         fields = ["SHAPE@", "osm_id", "name", "osm_type", "osm_tags", "osm_version", "osm_action"]
+        
+        # 0. Build Topology Index
+        arcpy.AddMessage(f"Building background Topology Index ({len(nodes)} total structural node(s))...")
+        top_rows = []
+        for nid, (lon, lat) in nodes.items():
+            str_nid = str(nid)
+            if str_nid not in existing_top:
+                pt = arcpy.PointGeometry(arcpy.Point(lon, lat), sr_wgs84)
+                top_rows.append([pt, str_nid])
+                
+        if top_rows:
+            with arcpy.da.InsertCursor(top_fc, ["SHAPE@", "osm_id"]) as cur:
+                for row in top_rows:
+                    cur.insertRow(row)
         
         # 1. Insert Points
         if tagged_nodes:
@@ -391,12 +406,13 @@ class UploadOSMData(object):
 
     def getParameterInfo(self):
         """Define parameter definitions"""
-        param_in_gdb = arcpy.Parameter(
-            displayName="Edited Workspace/Geodatabase",
-            name="in_gdb",
-            datatype="DEWorkspace",
+        param_in_layers = arcpy.Parameter(
+            displayName="OSM Layers to Upload (Points, Lines, Polygons)",
+            name="in_layers",
+            datatype="GPFeatureLayer",
             parameterType="Required",
-            direction="Input"
+            direction="Input",
+            multiValue=True
         )
         
         param_changeset_comment = arcpy.Parameter(
@@ -408,7 +424,7 @@ class UploadOSMData(object):
         )
         param_changeset_comment.value = "ArcGIS Pro OSM Edits"
 
-        params = [param_in_gdb, param_changeset_comment]
+        params = [param_in_layers, param_changeset_comment]
         return params
 
     def isLicensed(self):
@@ -422,19 +438,174 @@ class UploadOSMData(object):
 
     def execute(self, parameters, messages):
         """The source code of the tool."""
-        in_gdb = parameters[0].valueAsText
+        # Convert the raw semi-colon string of layer names into an iterable list
+        raw_layers = parameters[0].valueAsText
+        in_layers = [lyr.strip("'") for lyr in raw_layers.split(';')] if raw_layers else []
         comment = parameters[1].valueAsText
 
         arcpy.AddMessage("Validating credentials...")
-        if not OSM_USERNAME or OSM_USERNAME == "your_username_here":
-            arcpy.AddError("OSM Username is not configured in the script. Please open OSM_Editor.pyt and set your login information.")
+        if not OSM_BEARER_TOKEN or OSM_BEARER_TOKEN == "your_personal_access_token_here":
+            arcpy.AddError("OSM Personal Access Token is missing from the script. Open OSM_Editor.pyt to paste your token.")
+            return
+            
+        # 1. First, check all selected layers for any edited features
+        edited_features_count = 0
+        where_clause = "osm_action IN ('create', 'modify', 'delete')"
+        
+        arcpy.AddMessage("Scanning selected features for OSM edits...")
+        
+        for layer in in_layers:
+            if arcpy.Exists(layer):
+                # Using arcpy.da.SearchCursor automatically honors the user's manual active map selection!
+                with arcpy.da.SearchCursor(layer, ["osm_id", "osm_action"], where_clause=where_clause) as cur:
+                    for row in cur:
+                        edited_features_count += 1
+                        
+        if edited_features_count == 0:
+            arcpy.AddWarning("No edited features found in your selection.")
+            arcpy.AddMessage("Remember to change the 'osm_action' field (to 'create', 'modify', or 'delete') in the Attribute Table on the precise features you want to upload!")
             return
 
-        arcpy.AddMessage(f"Authenticating as user: {OSM_USERNAME}")
-        arcpy.AddMessage("Creating changeset...")
+        arcpy.AddMessage("Authenticating with standard OAuth 2.0 Bearer Token...")
+        auth_header = f"Bearer {OSM_BEARER_TOKEN}"
         
-        # NOTE: Full implementation will scan the Feature Classes for changes (like an 'osm_version' or 'osm_action' field),
-        # convert them into OSM Diff format, and submit to OSM API via PUT/POST.
+        # 1. Open Changeset
+        arcpy.AddMessage(f"Opening OSM Changeset with comment: '{comment}'")
+        changeset_xml = f"""<osm>
+          <changeset>
+            <tag k="created_by" v="ArcGIS Pro OSM Editor"/>
+            <tag k="comment" v="{escape(comment)}"/>
+          </changeset>
+        </osm>"""
+        
+        req = urllib.request.Request(f"{OSM_API_URL}changeset/create", data=changeset_xml.encode('utf-8'), method='PUT')
+        req.add_header('Authorization', auth_header)
+        req.add_header('Content-Type', 'text/xml')
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                changeset_id = response.read().decode('utf-8').strip()
+            arcpy.AddMessage(f"-> Successfully opened Changeset #{changeset_id}")
+        except urllib.error.URLError as e:
+            arcpy.AddError(f"Failed to open Changeset (Check Password!): {e.read().decode('utf-8') if hasattr(e, 'read') else str(e)}")
+            return
+            
+        # 2. Build Topology Cache (for snap-to-existing-trail logic)
+        topology_cache = {}
+        if in_layers:
+            cat_path = arcpy.Describe(in_layers[0]).catalogPath
+            workspace = os.path.dirname(cat_path) if cat_path else ""
+            top_fc = os.path.join(workspace, "OSM_Topology_Nodes")
+            sr_wgs84 = arcpy.SpatialReference(4326)
+            
+            if arcpy.Exists(top_fc):
+                arcpy.AddMessage("Loading topology backbone to ensure proper path snapping...")
+                with arcpy.da.SearchCursor(top_fc, ["SHAPE@XY", "osm_id"], spatial_reference=sr_wgs84) as cur:
+                    for (x, y), osm_id in cur:
+                        if x is not None and y is not None:
+                            topology_cache[(round(x, 6), round(y, 6))] = osm_id
+                            
+        # 3. Process the Layers into OsmChange XML
+        xml_create = []
+        xml_modify = []
+        xml_delete = []
+        
+        # New geometries generate negative sequence IDs immediately
+        negative_id_counter = -1
+        
+        arcpy.AddMessage("Extracting geometries and translating to OSM XML...")
+        
+        for layer in in_layers:
+            if not arcpy.Exists(layer): continue
+            
+            desc = arcpy.Describe(layer)
+            geom_type = desc.shapeType
+            
+            with arcpy.da.SearchCursor(layer, ["SHAPE@", "osm_id", "osm_version", "osm_action", "osm_tags"], where_clause=where_clause, spatial_reference=sr_wgs84) as cur:
+                for row in cur:
+                    geom, o_id, o_version, o_action, o_tags = row
+                    if not geom: continue
+                    
+                    # Safety check: If a user drew a brand NEW feature but accidentally typed 'modify' 
+                    # in the Attribute Table instead of 'create', OSM will crash trying to modify 
+                    # a placeholder. Force it cleanly to 'create' if the feature lacks an OSM ID.
+                    if not o_id or str(o_id).strip() == "":
+                        if o_action == "delete":
+                            continue
+                        o_action = "create"
+                    
+                    tags_dict = json.loads(o_tags) if o_tags else {}
+                    tags_xml = "".join([f'<tag k="{escape(str(k))}" v="{escape(str(v))}"/>' for k, v in tags_dict.items()])
+                    
+                    if geom_type == "Point":
+                        p = geom.firstPoint
+                        node_id = str(o_id) if o_id and o_action != "create" else str(negative_id_counter)
+                        node_version = f' version="{o_version}"' if o_action != "create" and o_version else ""
+                        
+                        node_xml = f'<node id="{node_id}" lat="{p.Y}" lon="{p.X}" changeset="{changeset_id}"{node_version}>{tags_xml}</node>'
+                        
+                        if o_action == "create":
+                            xml_create.append(node_xml)
+                            negative_id_counter -= 1
+                        elif o_action == "modify": xml_modify.append(node_xml)
+                        elif o_action == "delete": xml_delete.append(node_xml)
+                            
+                    elif geom_type in ["Polyline", "Polygon"]:
+                        way_id = str(o_id) if o_id and o_action != "create" else str(negative_id_counter)
+                        way_version = f' version="{o_version}"' if o_action != "create" and o_version else ""
+                        if o_action == "create":
+                            negative_id_counter -= 1
+                            
+                        nd_refs = []
+                        # Extract all vertices to map as structural nodes
+                        for part in geom:
+                            for p in part:
+                                if p:
+                                    x_r, y_r = round(p.X, 6), round(p.Y, 6)
+                                    snap_id = topology_cache.get((x_r, y_r))
+                                    if snap_id:
+                                        nd_refs.append(f'<nd ref="{snap_id}"/>')
+                                    else:
+                                        # It's a brand new corner/bend! It gets a temporary Node ID injected
+                                        new_node_id = negative_id_counter
+                                        negative_id_counter -= 1
+                                        xml_create.append(f'<node id="{new_node_id}" lat="{p.Y}" lon="{p.X}" changeset="{changeset_id}"/>')
+                                        nd_refs.append(f'<nd ref="{new_node_id}"/>')
+                                        topology_cache[(x_r, y_r)] = str(new_node_id)
+                                        
+                        way_xml = f'<way id="{way_id}" changeset="{changeset_id}"{way_version}>' + "".join(nd_refs) + tags_xml + "</way>"
+                        
+                        if o_action == "create": xml_create.append(way_xml)
+                        elif o_action == "modify": xml_modify.append(way_xml)
+                        elif o_action == "delete": xml_delete.append(way_xml)
 
-        arcpy.AddMessage(f"Uploaded with comment: {comment}. (Placeholder)")
+        # 4. Transmit OsmChange file automatically to OpenStreetMap
+        arcpy.AddMessage("Transmitting XML packets to the OSM API...")
+        osm_change_payload = f"""<osmChange version="0.6" generator="ArcGIS Pro OSM Editor">
+  <create>{"".join(xml_create)}</create>
+  <modify>{"".join(xml_modify)}</modify>
+  <delete>{"".join(xml_delete)}</delete>
+</osmChange>"""
+
+        req = urllib.request.Request(f"{OSM_API_URL}changeset/{changeset_id}/upload", data=osm_change_payload.encode('utf-8'), method='POST')
+        req.add_header('Authorization', auth_header)
+        req.add_header('Content-Type', 'text/xml')
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                result = response.read().decode('utf-8')
+                arcpy.AddMessage("-> Edits accepted successfully by OpenStreetMap!")
+        except urllib.error.URLError as e:
+            err_msg = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
+            arcpy.AddError(f"OSM Rejected the upload due to server conflicts: {err_msg}")
+            
+        # 5. Cleanly shut the changeset door behind us
+        arcpy.AddMessage("Closing mapping changeset...")
+        req = urllib.request.Request(f"{OSM_API_URL}changeset/{changeset_id}/close", method='PUT')
+        req.add_header('Authorization', auth_header)
+        try:
+            urllib.request.urlopen(req)
+        except: pass
+        
+        arcpy.AddMessage(f"SUCCESS! Your edits are officially live on the map: https://www.openstreetmap.org/changeset/{changeset_id}")
         return
