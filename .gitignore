@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ArcGIS and Geodatabases
+*.gdb/
+*.lock
+*.atx
+*.log
+*.xml
+*.lyrx
+*.aprx
+.backups/
+
+# VS Code
+.vscode/
