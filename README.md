@@ -17,14 +17,20 @@ OpenStreetMap heavily enforces secure OAuth 2.0 Personal Access Tokens for mappi
 3. Run the included `get_osm_token.py` helper script in your terminal to easily generate your permanent Bearer Token.
 4. Edit the `OSM_Editor.pyt` file and paste your token into the `OSM_BEARER_TOKEN` variable at the top of the file!
 
-## How To Edit Data
-Every feature pulled down natively includes specialized backend attribute fields like `osm_id`, `osm_tags`, and most importantly: `osm_action`. 
+## How To Edit Data (Native ArcGIS Structure)
+Every downloaded OSM grouping doesn't just pull data; it meticulously prepares your ArcGIS workspace for rapid, standards-compliant editing.
 
-- **Modifying Attributes:** Change the name or tags of a road, then physically type `modify` into its `osm_action` column in the Attribute Table.
-- **Digitizing New Features:** Draw a brand new forest footprint or highway, and type `create` into the `osm_action` column (or just leave it blank and the script will autocorrect it for you!).
-- **Deleting Flags:** Type `delete` to permanently flag a feature for deletion on the server.
+### 1. The Semantic Dropdowns
+Instead of sifting through massive JSON blocks, the downloader physically extracts the 7 most globally mapped OSM tag keys (`highway`, `building`, `natural`, `waterway`, `amenity`, `landuse`, `leisure`) precisely into their own top-level Geodatabase text columns!
+- These columns are actively fortified using massive **ArcGIS Coded Value Domains**.
+- Click the `amenity` column on a node, and easily scroll over 50+ officially supported OpenStreetMap dictionary values (like `restaurant`, `bench`, `parking`) ensuring your datasets always perfectly adhere to global styling protocols without spelling mistakes.
+- Modify *any* value in these columns natively, and the Upload Tool elegantly recompiles your selection straight back into the XML upload stream transparently.
 
-*If you do not flag a pre-existing feature with an action phrase in the `osm_action` field, the Upload script will beautifully ignore the feature as a safety lock to prevent accidental map destruction!*
+### 2. Auto-Detecting Modifications
+You no longer need to manually flag features! The Downloader tool heavily leans into native **ArcGIS Editor Tracking** logic.
+- **Modifying:** The second you reposition a vertex or select a new Dropdown Domain value on a pre-existing trail, ArcGIS perfectly timestamps your `last_edited_date`. Upon compiling the upload changeset, the tool calculates this timestamp gap behind closed doors, instantly recognizing your input, and completely overrides the system to package it as an OSM `<modify>` payload. You don't have to flag anything manually!
+- **Digitizing New Features:** Because we bound `"Create"` directly to the Feature Class *Default Values*, whenever you utilize the standard ArcGIS "Create Features" sketching ribbon to digitize a brand new line, the tool inherently locks its internal tagging natively to `<create>` right out of the box!
+- **Deleting Flags:** To permanently obliterate a feature globally from the OpenStreetMap network, explicitly click its `osm_action` dropdown and select `Delete (Remove Feature)`.
 
 ## Limitations & Best Practices: The Topology Gap
 GIS Applications like ArcGIS process spatial lines fundamentally differently than OpenStreetMap. ArcGIS defines a polyline as an independent array of geographic coordinates. OpenStreetMap defines a road as a specific, mathematically-shared sequence of numerical `Node IDs`.

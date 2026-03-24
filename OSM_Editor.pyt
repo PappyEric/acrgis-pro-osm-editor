@@ -201,9 +201,9 @@ out meta qt;"""
                         osm_data = json.loads(response.read().decode('utf-8'))
                         break  # Stop trying other endpoints if successful
                     else:
-                        arcpy.AddWarning(f"Endpoint {endpoint} returned status {response.status}")
+                        arcpy.AddMessage(f"  -> Server busy (Status {response.status}), failing over to backup...")
             except Exception as e:
-                arcpy.AddWarning(f"Endpoint failed: {e}")
+                arcpy.AddMessage(f"  -> Server busy ({str(e)}), failing over to backup...")
                 
         if not osm_data:
             arcpy.AddError("All Overpass API endpoints failed (Server too busy). Please try again in a few minutes or zoom in a bit closer.")
@@ -234,15 +234,85 @@ out meta qt;"""
         py_fc = os.path.join(out_gdb, "OSM_Polygons")
         top_fc = os.path.join(out_gdb, "OSM_Topology_Nodes")
         
+        # Build Domain for osm_action
+        domain_name = "OSM_Action_Domain"
+        
+        osm_semantics = {
+            "OSM_Highway_Domain": ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential", "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link", "living_street", "service", "pedestrian", "track", "bus_guideway", "escape", "raceway", "road", "busway", "footway", "bridleway", "steps", "corridor", "path", "cycleway", "proposed", "construction"],
+            "OSM_Building_Domain": ["yes", "commercial", "office", "industrial", "retail", "supermarket", "warehouse", "residential", "apartments", "house", "detached", "terrace", "dormitory", "hotel", "school", "university", "college", "hospital", "clinic", "civic", "government", "public", "parking", "garage", "garages", "roof", "church", "barn", "shed", "greenhouse", "construction"],
+            "OSM_Natural_Domain": ["wood", "tree_row", "tree", "scrub", "heath", "moor", "grassland", "fell", "bare_rock", "scree", "shingle", "sand", "mud", "water", "wetland", "glacier", "bay", "strait", "cape", "beach", "coastline", "spring", "hot_spring", "geyser", "peak", "volcano", "valley", "ridge", "cliff", "saddle", "dune", "rock", "stone", "sinkhole", "cave_entrance"],
+            "OSM_Waterway_Domain": ["river", "riverbank", "stream", "tidal_channel", "canal", "drain", "ditch", "wadi", "fairway", "dock", "boatyard", "dam", "weir", "waterfall", "lock_gate"],
+            "OSM_Amenity_Domain": ["bar", "cafe", "fast_food", "food_court", "ice_cream", "pub", "restaurant", "college", "kindergarten", "library", "school", "university", "car_wash", "fuel", "parking", "parking_space", "taxi", "bank", "atm", "clinic", "dentist", "doctors", "hospital", "pharmacy", "veterinary", "arts_centre", "cinema", "community_centre", "nightclub", "theatre", "courthouse", "fire_station", "police", "post_box", "post_office", "prison", "townhall", "bench", "drinking_water", "fountain", "place_of_worship", "shelter", "toilets", "waste_basket"],
+            "OSM_Landuse_Domain": ["commercial", "construction", "education", "industrial", "residential", "retail", "institutional", "aquaculture", "allotments", "farmland", "farmyard", "forest", "meadow", "orchard", "plant_nursery", "vineyard", "basin", "reservoir", "salt_pond", "brownfield", "cemetery", "conservation", "depot", "garages", "grass", "greenfield", "military", "port", "quarry", "railway", "recreation_ground", "religious", "village_green", "winter_sports"],
+            "OSM_Leisure_Domain": ["adult_gaming_centre", "amusement_arcade", "beach_resort", "bandstand", "bird_hide", "common", "dance", "dog_park", "firepit", "fishing", "fitness_centre", "fitness_station", "garden", "golf_course", "horse_riding", "ice_rink", "marina", "miniature_golf", "nature_reserve", "park", "picnic_table", "pitch", "playground", "slipway", "sports_centre", "stadium", "summer_camp", "swimming_area", "swimming_pool", "track", "water_park"]
+        }
+        
+        try:
+            existing_domains = [d.name for d in arcpy.da.ListDomains(out_gdb)]
+            if domain_name not in existing_domains:
+                arcpy.management.CreateDomain(out_gdb, domain_name, "OpenStreetMap Upload Action", "TEXT", "CODED")
+                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "none", "None (Do not upload)")
+                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "create", "Create (New Feature)")
+                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "modify", "Modify (Edit Feature)")
+                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "delete", "Delete (Remove Feature)")
+                
+            for d_name, d_values in osm_semantics.items():
+                if d_name not in existing_domains:
+                    arcpy.management.CreateDomain(out_gdb, d_name, f"OSM {d_name.split('_')[1]} Tags", "TEXT", "CODED")
+                    for val in d_values:
+                        arcpy.management.AddCodedValueToDomain(out_gdb, d_name, val, val.replace("_", " ").title())
+        except Exception as e:
+            arcpy.AddWarning(f"Notice: Could not build all Dropdown Domains in {out_gdb}. The underlying Geodatabase is currently locked by ArcGIS. (Error: {str(e)})")
+            
         def create_fc(fc, geom_type):
             if not arcpy.Exists(fc):
                 arcpy.management.CreateFeatureclass(out_gdb, os.path.basename(fc), geom_type, spatial_reference=sr_wgs84)
-                arcpy.management.AddField(fc, "osm_id", "TEXT", field_length=25)
-                arcpy.management.AddField(fc, "name", "TEXT", field_length=255)
-                arcpy.management.AddField(fc, "osm_type", "TEXT", field_length=50)
-                arcpy.management.AddField(fc, "osm_tags", "TEXT", field_length=2000)
-                arcpy.management.AddField(fc, "osm_version", "LONG")
-                arcpy.management.AddField(fc, "osm_action", "TEXT", field_length=20)
+            
+            # Safety checks for existing Feature Classes to ensure they get the newest schema updates!
+            existing_fields = [f.name for f in arcpy.ListFields(fc)]
+            
+            def add_field_safely(fname, ftype, flen=None):
+                if fname not in existing_fields:
+                    arcpy.management.AddField(fc, fname, ftype, field_length=flen)
+                    
+            add_field_safely("osm_id", "TEXT", 25)
+            add_field_safely("name", "TEXT", 255)
+            add_field_safely("osm_type", "TEXT", 50)
+            add_field_safely("osm_tags", "TEXT", 2000)
+            add_field_safely("osm_version", "LONG")
+            add_field_safely("osm_action", "TEXT", 20)
+            
+            # Apply Domain and default value!
+            try:
+                arcpy.management.AssignDomainToField(fc, "osm_action", domain_name)
+                arcpy.management.AssignDefaultToField(fc, "osm_action", "create")
+            except Exception as e:
+                arcpy.AddWarning(f"Notice: Could not assign dropdown domain to {os.path.basename(fc)}. The layer is likely locked because it is actively open in your Map. (Error: {str(e)})")
+                
+            # Added semantic fields and attached their extensive Dropdown Domains!
+            for sem_field, dom_binding in [("highway", "OSM_Highway_Domain"), ("building", "OSM_Building_Domain"), 
+                                           ("natural", "OSM_Natural_Domain"), ("waterway", "OSM_Waterway_Domain"), 
+                                           ("amenity", "OSM_Amenity_Domain"), ("landuse", "OSM_Landuse_Domain"), 
+                                           ("leisure", "OSM_Leisure_Domain")]:
+                add_field_safely(sem_field, "TEXT", 150)
+                try:
+                    arcpy.management.AssignDomainToField(fc, sem_field, dom_binding)
+                except Exception:
+                    pass
+            
+            # Enable Editor Tracking to seamlessly auto-detect modified geometries and attributes!
+            try:
+                arcpy.management.EnableEditorTracking(
+                    fc, 
+                    creator_field="created_user",
+                    creation_date_field="created_date",
+                    last_editor_field="last_edited_user",
+                    last_edit_date_field="last_edited_date",
+                    add_fields="ADD_FIELDS",
+                    record_dates_in="UTC"
+                )
+            except Exception:
+                pass
 
         create_fc(pt_fc, "POINT")
         create_fc(ln_fc, "POLYLINE")
@@ -267,7 +337,8 @@ out meta qt;"""
         existing_pys = get_existing_ids(py_fc)
         existing_top = get_existing_ids(top_fc)
         
-        fields = ["SHAPE@", "osm_id", "name", "osm_type", "osm_tags", "osm_version", "osm_action"]
+        fields = ["SHAPE@", "osm_id", "name", "osm_type", "osm_tags", "osm_version", "osm_action",
+                  "highway", "building", "natural", "waterway", "amenity", "landuse", "leisure"]
         
         # 0. Build Topology Index
         arcpy.AddMessage(f"Building background Topology Index ({len(nodes)} total structural node(s))...")
@@ -293,12 +364,23 @@ out meta qt;"""
                         continue
                         
                     pt = arcpy.PointGeometry(arcpy.Point(n["lon"], n["lat"]), sr_wgs84)
-                    tags = json.dumps(n.get("tags", {}))
-                    name = n.get("tags", {}).get("name", "")
-                    osm_type = "amenity" if "amenity" in n.get("tags", {}) else str(list(n.get("tags", {}).keys())[0] if n.get("tags") else "node")
+                    tags_dict_val = n.get("tags", {})
+                    tags = json.dumps(tags_dict_val)
+                    name = tags_dict_val.get("name", "")
+                    osm_type = "amenity" if "amenity" in tags_dict_val else str(list(tags_dict_val.keys())[0] if tags_dict_val else "node")
                     version = n.get("version", 1)
                     
-                    cursor.insertRow([pt, str_id, name[:254], osm_type[:49], tags[:1999], version, "none"])
+                    # Semantics
+                    hw = tags_dict_val.get("highway", "")
+                    bd = tags_dict_val.get("building", "")
+                    nt = tags_dict_val.get("natural", "")
+                    ww = tags_dict_val.get("waterway", "")
+                    am = tags_dict_val.get("amenity", "")
+                    lu = tags_dict_val.get("landuse", "")
+                    ls = tags_dict_val.get("leisure", "")
+                    
+                    cursor.insertRow([pt, str_id, name[:254], osm_type[:49], tags[:1999], version, "none",
+                                      hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149]])
                     
         # 2. Insert Lines & Polygons
         if ways:
@@ -345,18 +427,29 @@ out meta qt;"""
                 poly_keys = ["building", "leisure", "landuse", "amenity", "natural", "shop", "tourism", "historic"]
                 force_poly = any(k in tags_dict for k in poly_keys)
                 
+                # Semantics
+                hw = tags_dict.get("highway", "")
+                bd = tags_dict.get("building", "")
+                nt = tags_dict.get("natural", "")
+                ww = tags_dict.get("waterway", "")
+                am = tags_dict.get("amenity", "")
+                lu = tags_dict.get("landuse", "")
+                ls = tags_dict.get("leisure", "")
+
                 if is_closed and (force_poly or tags_dict.get("area") == "yes") and not force_line:
                     if str_id in existing_pys:
                         continue
                     geom = arcpy.Polygon(arr, sr_wgs84)
                     if geom and geom.area > 0:
-                        poly_rows.append([geom, str_id, name[:254], osm_type[:49], tags_str[:1999], version, "none"])
+                        poly_rows.append([geom, str_id, name[:254], osm_type[:49], tags_str[:1999], version, "none",
+                                          hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149]])
                 else:
                     if str_id in existing_lns:
                         continue
                     geom = arcpy.Polyline(arr, sr_wgs84)
                     if geom and geom.length > 0:
-                        line_rows.append([geom, str_id, name[:254], osm_type[:49], tags_str[:1999], version, "none"])
+                        line_rows.append([geom, str_id, name[:254], osm_type[:49], tags_str[:1999], version, "none",
+                                          hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149]])
 
             if line_rows:
                 arcpy.AddMessage(f"Writing {len(line_rows)} Lines...")
@@ -450,16 +543,31 @@ class UploadOSMData(object):
             
         # 1. First, check all selected layers for any edited features
         edited_features_count = 0
-        where_clause = "osm_action IN ('create', 'modify', 'delete')"
         
-        arcpy.AddMessage("Scanning selected features for OSM edits...")
+        arcpy.AddMessage("Scanning selected features for manual OSM edits and auto-detecting spatial modifications...")
         
         for layer in in_layers:
             if arcpy.Exists(layer):
+                desc = arcpy.Describe(layer)
+                has_editor_tracking = getattr(desc, 'editorTrackingEnabled', False)
+                c_field = getattr(desc, 'creationDateField', "")
+                e_field = getattr(desc, 'editDateField', "")
+                
+                s_fields = ["osm_action"]
+                if has_editor_tracking and c_field and e_field:
+                    s_fields.extend([c_field, e_field])
+                
                 # Using arcpy.da.SearchCursor automatically honors the user's manual active map selection!
-                with arcpy.da.SearchCursor(layer, ["osm_id", "osm_action"], where_clause=where_clause) as cur:
+                with arcpy.da.SearchCursor(layer, s_fields) as cur:
                     for row in cur:
-                        edited_features_count += 1
+                        action = row[0]
+                        if action in ['create', 'modify', 'delete']:
+                            edited_features_count += 1
+                        elif has_editor_tracking and len(row) > 1:
+                            # Auto-detect! If edited more than 2 secs after creation, user physically touched it
+                            c_date, e_date = row[1], row[2]
+                            if c_date and e_date and (e_date - c_date).total_seconds() > 2.0:
+                                edited_features_count += 1
                         
         if edited_features_count == 0:
             arcpy.AddWarning("No edited features found in your selection.")
@@ -520,10 +628,41 @@ class UploadOSMData(object):
             
             desc = arcpy.Describe(layer)
             geom_type = desc.shapeType
+            all_fields = [f.name for f in arcpy.ListFields(layer)]
+            has_editor_tracking = getattr(desc, 'editorTrackingEnabled', False)
+            c_field = getattr(desc, 'creationDateField', "")
+            e_field = getattr(desc, 'editDateField', "")
             
-            with arcpy.da.SearchCursor(layer, ["SHAPE@", "osm_id", "osm_version", "osm_action", "osm_tags"], where_clause=where_clause, spatial_reference=sr_wgs84) as cur:
+            # Identify which of our semantic fields actually exist in the table being uploaded
+            semantic_candidates = ["name", "highway", "building", "natural", "waterway", "amenity", "landuse", "leisure"]
+            active_semantics = [f for f in semantic_candidates if f in all_fields]
+            
+            search_fields = ["SHAPE@", "osm_id", "osm_version", "osm_action", "osm_tags"] + active_semantics
+            
+            offset = len(search_fields)
+            if has_editor_tracking and c_field and e_field:
+                search_fields.extend([c_field, e_field])
+            
+            with arcpy.da.SearchCursor(layer, search_fields, spatial_reference=sr_wgs84) as cur:
                 for row in cur:
-                    geom, o_id, o_version, o_action, o_tags = row
+                    is_modified = False
+                    if has_editor_tracking and len(row) > offset:
+                        c_date, e_date = row[offset], row[offset+1]
+                        if c_date and e_date and (e_date - c_date).total_seconds() > 2.0:
+                            is_modified = True
+                            
+                    geom = row[0]
+                    o_id = row[1]
+                    o_version = row[2]
+                    o_action = row[3]
+                    o_tags = row[4]
+                    
+                    if o_action not in ['create', 'modify', 'delete'] and not is_modified:
+                        continue
+                        
+                    if is_modified and o_action == 'none':
+                        o_action = 'modify' # Autostamp for XML converter!
+                        
                     if not geom: continue
                     
                     # Safety check: If a user drew a brand NEW feature but accidentally typed 'modify' 
@@ -535,6 +674,16 @@ class UploadOSMData(object):
                         o_action = "create"
                     
                     tags_dict = json.loads(o_tags) if o_tags else {}
+                    
+                    # Intercept any user edits directly from the standard GIS Attribute fields!
+                    for idx, field_name in enumerate(active_semantics):
+                        val = row[5 + idx]
+                        if val is not None and str(val).strip() != "":
+                            tags_dict[field_name] = str(val).strip()
+                        else:
+                            # If the user explicitly deleted a value from the table, we delete the tag
+                            if field_name in tags_dict:
+                                del tags_dict[field_name]
                     tags_xml = "".join([f'<tag k="{escape(str(k))}" v="{escape(str(v))}"/>' for k, v in tags_dict.items()])
                     
                     if geom_type == "Point":
