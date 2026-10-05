@@ -11,6 +11,32 @@ import re
 import time
 from xml.sax.saxutils import escape
 
+def xml_escape_attr(val):
+    """Escapes XML special characters including quotes for attribute values."""
+    if val is None:
+        return ""
+    return escape(str(val), entities={'"': "&quot;", "'": "&apos;"})
+
+def fetch_osm_element_version(elem_type, elem_id):
+    """Queries the OSM API to retrieve the latest live version number of a node/way/relation."""
+    if not elem_type or not elem_id or str(elem_id).startswith("-"):
+        return None
+    try:
+        url = f"{OSM_API_URL}{elem_type}/{elem_id}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'ArcGIS-Pro-OSM-Editor/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                xml_str = resp.read().decode('utf-8')
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(xml_str)
+                elem = root.find(elem_type)
+                if elem is not None and "version" in elem.attrib:
+                    return int(elem.attrib["version"])
+    except Exception:
+        pass
+    return None
+
+
 # --- OSM Address & Name Normalization Standards ---
 STREET_SUFFIX_EXPANSIONS = {
     "ST": "Street", "STR": "Street", "ST.": "Street",
@@ -274,6 +300,7 @@ class DownloadOSMData(object):
             parameterType="Required",
             direction="Input"
         )
+        param_out_gdb.value = r"E:\Working_OSM\MetroToOSM.gdb"
 
         params = [param_extent, param_data_types, param_out_gdb]
         return params
@@ -282,6 +309,8 @@ class DownloadOSMData(object):
         return True
 
     def updateParameters(self, parameters):
+        if not parameters[2].altered and not parameters[2].value:
+            parameters[2].value = r"E:\Working_OSM\MetroToOSM.gdb"
         return
 
     def updateMessages(self, parameters):
@@ -526,10 +555,32 @@ out meta qt;"""
                 for row in top_rows:
                     cur.insertRow(row)
         
+        def is_address_node(tags_dict):
+            address_keys = {"addr:housenumber", "addr:street", "addr:full", "addr:unit", "addr:flats", "addr:suite", "addr:housename", "addr:conscriptionnumber", "addr:postcode", "addr:city", "addr:state"}
+            return any(k in address_keys or k.startswith("addr:") for k in tags_dict)
+
+        def is_requested_poi_node(tags_dict, selected_data_types):
+            if "Businesses/Amenities" in selected_data_types and "amenity" in tags_dict:
+                return True
+            if "Shops & Retail" in selected_data_types and "shop" in tags_dict:
+                return True
+            if "Tourism & Historic" in selected_data_types and ("tourism" in tags_dict or "historic" in tags_dict):
+                return True
+            if "Power Infrastructure" in selected_data_types and "power" in tags_dict:
+                return True
+            if "Natural (Trees, Forests, Scrub)" in selected_data_types and "natural" in tags_dict:
+                return True
+            if "Emergency Services" in selected_data_types and "emergency" in tags_dict:
+                return True
+            if "Public Transport (Railway, Bus)" in selected_data_types and ("public_transport" in tags_dict or "railway" in tags_dict):
+                return True
+            return False
+
         if tagged_nodes:
-            arcpy.AddMessage(f"Inserting {len(tagged_nodes)} Points...")
+            filtered_nodes = [n for n in tagged_nodes if is_address_node(n.get("tags", {})) or is_requested_poi_node(n.get("tags", {}), data_types)]
+            arcpy.AddMessage(f"Inserting {len(filtered_nodes)} Point node(s) into OSM_Points (filtered from {len(tagged_nodes)} total tagged nodes)...")
             with arcpy.da.InsertCursor(pt_fc, fields) as cursor:
-                for n in tagged_nodes:
+                for n in filtered_nodes:
                     str_id = str(n["id"])
                     if str_id in existing_pts:
                         continue
@@ -762,7 +813,7 @@ class UploadOSMData(object):
         changeset_xml = f"""<osm>
   <changeset>
     <tag k="created_by" v="ArcGIS Pro OSM Editor"/>
-    <tag k="comment" v="{escape(comment)}"/>
+    <tag k="comment" v="{xml_escape_attr(comment)}"/>
   </changeset>
 </osm>"""
         
@@ -834,6 +885,7 @@ class UploadOSMData(object):
             if has_editor_tracking and c_field and e_field:
                 search_fields.extend([c_field, e_field])
             
+            processed_count = 0
             with arcpy.da.SearchCursor(layer, search_fields, spatial_reference=sr_wgs84) as cur:
                 for row in cur:
                     is_modified = False
@@ -847,6 +899,11 @@ class UploadOSMData(object):
                     o_id = row[2]
                     o_version = row[3]
                     o_action = row[4]
+
+                    if o_action in ['create', 'modify', 'delete'] or is_modified:
+                        processed_count += 1
+                        if processed_count % 100 == 0:
+                            arcpy.AddMessage(f"  -> Translated {processed_count} edited features from '{os.path.basename(layer)}' to OSM XML...")
                     o_tags = row[5]
                     
                     if o_action not in ['create', 'modify', 'delete'] and not is_modified:
@@ -861,6 +918,10 @@ class UploadOSMData(object):
                         if o_action == "delete":
                             continue
                         o_action = "create"
+                    else:
+                        if not o_version or (isinstance(o_version, int) and o_version <= 0):
+                            o_version = 1
+
                     
                     try:
                         tags_dict = json.loads(o_tags) if o_tags else {}
@@ -904,7 +965,7 @@ class UploadOSMData(object):
                         if not any(k in tags_dict for k in area_keys):
                             tags_dict["building"] = "yes"
 
-                    tags_xml = "".join([f'<tag k="{escape(str(k))}" v="{escape(str(v))}"/>' for k, v in tags_dict.items()])
+                    tags_xml = "".join([f'<tag k="{xml_escape_attr(k)}" v="{xml_escape_attr(v)}"/>' for k, v in tags_dict.items()])
                     
                     if geom_type == "Point":
                         p = geom.firstPoint
@@ -967,8 +1028,50 @@ class UploadOSMData(object):
                 arcpy.AddMessage("-> Edits accepted successfully by OpenStreetMap!")
         except urllib.error.URLError as e:
             err_msg = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
-            arcpy.AddError(f"OSM Rejected the upload due to server conflicts: {err_msg}")
-            return
+            vm_match = re.search(r'Version mismatch: Provided \d+, server had: (\d+) of (Node|Way) (\d+)', err_msg, re.IGNORECASE)
+            if vm_match:
+                server_ver = int(vm_match.group(1))
+                elem_kind_str = vm_match.group(2)
+                elem_id_str = vm_match.group(3)
+                arcpy.AddMessage(f"-> Auto-resolving version conflict: {elem_kind_str} {elem_id_str} is at version {server_ver} on OSM server. Updating local table...")
+                
+                for lyr in in_layers:
+                    if arcpy.Exists(lyr):
+                        lyr_fields = [f.name for f in arcpy.ListFields(lyr)]
+                        if "osm_id" in lyr_fields and "osm_version" in lyr_fields:
+                            with arcpy.da.UpdateCursor(lyr, ["osm_id", "osm_version"]) as ucur:
+                                for urow in ucur:
+                                    if urow[0] and str(urow[0]).strip() == elem_id_str:
+                                        urow[1] = server_ver
+                                        ucur.updateRow(urow)
+                
+                arcpy.AddMessage("Retrying upload with synchronized version...")
+                fixed_payload = re.sub(
+                    rf'(<(?:node|way)\s+[^>]*id="{elem_id_str}"[^>]*\s+version=")\d+(")',
+                    rf'\g<1>{server_ver}\g<2>',
+                    osm_change_payload
+                )
+                if fixed_payload == osm_change_payload:
+                    fixed_payload = re.sub(
+                        rf'id="{elem_id_str}"',
+                        rf'id="{elem_id_str}" version="{server_ver}"',
+                        osm_change_payload
+                    )
+
+                req_retry = urllib.request.Request(f"{OSM_API_URL}changeset/{changeset_id}/upload", data=fixed_payload.encode('utf-8'), method='POST')
+                req_retry.add_header('Authorization', auth_header)
+                req_retry.add_header('Content-Type', 'text/xml')
+                try:
+                    with urllib.request.urlopen(req_retry) as resp_retry:
+                        result = resp_retry.read().decode('utf-8')
+                        arcpy.AddMessage("-> Edits accepted successfully by OpenStreetMap after version auto-resolution!")
+                except urllib.error.URLError as e_retry:
+                    err_msg_retry = e_retry.read().decode('utf-8') if hasattr(e_retry, 'read') else str(e_retry)
+                    arcpy.AddError(f"OSM Rejected the upload due to server conflicts: {err_msg_retry}")
+                    return
+            else:
+                arcpy.AddError(f"OSM Rejected the upload due to server conflicts: {err_msg}")
+                return
             
         import xml.etree.ElementTree as ET
         id_map = {}
@@ -1470,6 +1573,17 @@ class TagBuildingsFromPoints(object):
                     addr_field_map[tag_key] = real_fld
                     addr_cursor_fields.append(real_fld)
 
+            real_osm_id_fld = resolve_layer_field(in_address_points, "osm_id")
+            if real_osm_id_fld:
+                addr_field_map["osm_id"] = real_osm_id_fld
+                addr_cursor_fields.append(real_osm_id_fld)
+
+            real_osm_ver_fld = resolve_layer_field(in_address_points, "osm_version")
+            if real_osm_ver_fld:
+                addr_field_map["osm_version"] = real_osm_ver_fld
+                addr_cursor_fields.append(real_osm_ver_fld)
+
+
             arcpy.AddMessage(f"Mapped address fields: {addr_field_map}")
             arcpy.AddMessage("Fast spatial filtering address points to building footprints...")
 
@@ -1642,8 +1756,13 @@ class TagBuildingsFromPoints(object):
                                 if pt_pc: pt_node_tags["addr:postcode"] = pt_pc
                                 if pt_full: pt_node_tags["addr:full"] = pt_full
 
+                                pt_osm_id = addr_item.get("osm_id", "").strip()
+                                pt_osm_ver_raw = addr_item.get("osm_version", 1)
+                                try: pt_osm_ver = int(pt_osm_ver_raw)
+                                except: pt_osm_ver = 1
+
                                 multiunit_points_to_insert.append([
-                                    pt_geom, "", suite_name[:254], "node", json.dumps(pt_node_tags), 1, "create",
+                                    pt_geom, pt_osm_id, suite_name[:254], "node", json.dumps(pt_node_tags), pt_osm_ver, "create",
                                     pt_hn[:49], pt_st[:149], pt_un[:49], pt_ct[:99], pt_state[:49], pt_pc[:19], pt_full[:254]
                                 ])
                     elif is_multi_unit and multiunit_mode.startswith("Combine all units"):
@@ -1701,19 +1820,103 @@ class TagBuildingsFromPoints(object):
 
                 cur.updateRow(row)
 
-        # 4. Insert Multi-Unit Address Points into OSM_Points
+        # 4. Insert / Update Multi-Unit Address Points in OSM_Points with Deduplication
         if multiunit_points_to_insert and export_multiunit_points and arcpy.Exists(out_points_layer):
-            arcpy.AddMessage(f"Writing {len(multiunit_points_to_insert)} individual apartment/suite address node(s) into '{out_points_layer}'...")
-            pt_insert_fields = [
-                "SHAPE@", "osm_id", "name", "osm_type", "osm_tags", "osm_version", "osm_action",
-                "addr_housenumber", "addr_street", "addr_unit", "addr_city", "addr_state",
-                "addr_postcode", "addr_full"
-            ]
-            with arcpy.da.InsertCursor(out_points_layer, pt_insert_fields) as pt_cur:
-                for pt_row in multiunit_points_to_insert:
-                    pt_cur.insertRow(pt_row)
+            arcpy.AddMessage(f"Processing {len(multiunit_points_to_insert)} address node(s) for '{out_points_layer}' with deduplication check...")
+            
+            existing_pt_map = {} # osm_id -> OID
+            existing_spatial_pt_list = [] # list of (OID, pt_geom, hn_lower, st_lower, un_lower)
+            
+            read_fields = ["OID@", "SHAPE@", "osm_id", "addr_housenumber", "addr_street", "addr_unit"]
+            try:
+                with arcpy.da.SearchCursor(out_points_layer, read_fields, spatial_reference=sr_buildings) as s_cur:
+                    for s_row in s_cur:
+                        oid, shape_g, o_id, o_hn, o_st, o_un = s_row
+                        if o_id and str(o_id).strip():
+                            existing_pt_map[str(o_id).strip()] = oid
+                        if shape_g:
+                            hn_l = (o_hn or "").strip().lower()
+                            st_l = (o_st or "").strip().lower()
+                            un_l = (o_un or "").strip().lower()
+                            existing_spatial_pt_list.append((oid, shape_g, hn_l, st_l, un_l))
+            except Exception as e:
+                arcpy.AddWarning(f"Notice during point deduplication index build: {e}")
 
-            arcpy.AddMessage(f"-> Successfully created {len(multiunit_points_to_insert)} address node(s) in '{out_points_layer}'.")
+            points_to_insert = []
+            points_to_update = {} # OID -> pt_row_data
+
+            for pt_row in multiunit_points_to_insert:
+                p_geom, p_osmid, p_name, p_type, p_tags, p_ver, p_action, p_hn, p_st, p_un, p_ct, p_state, p_pc, p_full = pt_row
+                
+                matched_oid = None
+                # 1. Match by osm_id
+                if p_osmid and str(p_osmid).strip() in existing_pt_map:
+                    matched_oid = existing_pt_map[str(p_osmid).strip()]
+                
+                # 2. Match spatially + normalized address
+                if not matched_oid and p_geom:
+                    p_hn_l = (p_hn or "").strip().lower()
+                    p_st_l = (p_st or "").strip().lower()
+                    p_un_l = (p_un or "").strip().lower()
+                    
+                    for ex_oid, ex_geom, ex_hn, ex_st, ex_un in existing_spatial_pt_list:
+                        # Proximity check (within ~5 feet / 1.5m)
+                        if p_geom.distanceTo(ex_geom) <= 2.0:
+                            if p_hn_l == ex_hn and p_st_l == ex_st and (not p_un_l or p_un_l == ex_un):
+                                matched_oid = ex_oid
+                                break
+
+                if matched_oid:
+                    points_to_update[matched_oid] = pt_row
+                else:
+                    points_to_insert.append(pt_row)
+                    # Add to spatial index to avoid duplicating within the current run
+                    p_hn_l = (p_hn or "").strip().lower()
+                    p_st_l = (p_st or "").strip().lower()
+                    p_un_l = (p_un or "").strip().lower()
+                    existing_spatial_pt_list.append((-1, p_geom, p_hn_l, p_st_l, p_un_l))
+
+            # Perform Updates on Existing Points
+            if points_to_update:
+                arcpy.AddMessage(f"Updating {len(points_to_update)} existing address point(s) in '{out_points_layer}' (preventing duplicates)...")
+                update_fields_pt = ["OID@", "SHAPE@", "osm_id", "name", "osm_type", "osm_tags", "osm_version", "osm_action", "addr_housenumber", "addr_street", "addr_unit", "addr_city", "addr_state", "addr_postcode", "addr_full"]
+                with arcpy.da.UpdateCursor(out_points_layer, update_fields_pt, spatial_reference=sr_buildings) as u_cur:
+                    for u_row in u_cur:
+                        cur_oid = u_row[0]
+                        if cur_oid in points_to_update:
+                            up_data = points_to_update[cur_oid]
+                            # up_data: [p_geom, p_osmid, p_name, p_type, p_tags, p_ver, p_action, p_hn, p_st, p_un, p_ct, p_state, p_pc, p_full]
+                            if up_data[1]: u_row[2] = up_data[1] # osm_id
+                            u_row[3] = up_data[2] # name
+                            u_row[4] = up_data[3] # osm_type
+                            u_row[5] = up_data[4] # osm_tags
+                            # Preserve existing osm_version if valid (> 1), otherwise update with up_data[5]
+                            if not u_row[6] or u_row[6] <= 1:
+                                if up_data[5] and up_data[5] > 1:
+                                    u_row[6] = up_data[5]
+                            u_row[7] = "modify" if u_row[2] else "create" # osm_action
+                            u_row[8] = up_data[7] # addr_housenumber
+                            u_row[9] = up_data[8] # addr_street
+                            u_row[10] = up_data[9] # addr_unit
+                            u_row[11] = up_data[10] # addr_city
+                            u_row[12] = up_data[11] # addr_state
+                            u_row[13] = up_data[12] # addr_postcode
+                            u_row[14] = up_data[13] # addr_full
+                            u_cur.updateRow(u_row)
+
+            # Perform Inserts for New Points
+            if points_to_insert:
+                arcpy.AddMessage(f"Writing {len(points_to_insert)} new address node(s) into '{out_points_layer}'...")
+                pt_insert_fields = [
+                    "SHAPE@", "osm_id", "name", "osm_type", "osm_tags", "osm_version", "osm_action",
+                    "addr_housenumber", "addr_street", "addr_unit", "addr_city", "addr_state",
+                    "addr_postcode", "addr_full"
+                ]
+                with arcpy.da.InsertCursor(out_points_layer, pt_insert_fields) as pt_cur:
+                    for pt_row in points_to_insert:
+                        pt_cur.insertRow(pt_row)
+
+            arcpy.AddMessage(f"-> Successfully processed address node(s) in '{out_points_layer}' ({len(points_to_update)} updated, {len(points_to_insert)} created).")
 
             try:
                 aprx = arcpy.mp.ArcGISProject("CURRENT")
