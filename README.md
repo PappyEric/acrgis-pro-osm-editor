@@ -6,11 +6,12 @@ A lightweight, no-nonsense Python Toolbox for getting OpenStreetMap (OSM) vector
 
 If you've been around GIS for a while, you know the old ArcObjects OSM plugins were bloated, required massive back-end setups, and broke on every other update. This tool skips all that. We leverage vanilla Python and OSM’s REST API (Overpass/OAuth 2.0) to directly sync your local File Geodatabase with the live map.
 
-You get three tools:
+You get four tools:
 
 1. **Download OSM Data To Current View**: Grabs whatever's in your active map extent. It rips the JSON apart, dumps it cleanly into native Points, Lines, and Polygons, and builds a hidden topology node backbone so things actually snap together properly.
-2. **Tag OSM Buildings from Address & Name Points**: Performs an in-memory point-in-polygon spatial join between your GIS address / structure name points and the OSM building footprint polygons. Maps addresses into standard OSM `addr:*` tags and structure names into `name`, ready for upload.
-3. **Upload Edits to OSM**: Scans your local edits, converts them back to `osmChange` XML packets, and pushes them to your OSM account.
+2. **Download OSM Cemeteries by County**: Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`). Queries Overpass using geocoded county boundaries or custom map/layer extents, extracts dedicated `wikidata` and `ref:find_a_grave` fields, and offers instant filters for missing identifiers.
+3. **Tag OSM Buildings from Address & Name Points**: Performs an in-memory point-in-polygon spatial join between your GIS address / structure name points and the OSM building footprint polygons. Maps addresses into standard OSM `addr:*` tags and structure names into `name`, ready for upload.
+4. **Upload Edits to OSM**: Scans your local edits, converts them back to `osmChange` XML packets, and pushes them to your OSM account.
 
 ## Setup & Auth (Don't Skip This)
 
