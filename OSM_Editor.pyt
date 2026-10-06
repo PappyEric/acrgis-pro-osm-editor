@@ -349,8 +349,9 @@ OSM_BEARER_TOKEN = "your_personal_access_token_here"
 
 # OSM API Endpoints
 OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
     "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
     "https://z.overpass-api.de/api/interpreter"
 ]
 OSM_API_URL = "https://api.openstreetmap.org/api/0.6/"
@@ -856,8 +857,8 @@ class DownloadCemeteries(object):
     def __init__(self):
         self.label = "Download OSM Cemeteries by County"
         self.description = (
-            "Downloads OpenStreetMap cemetery and graveyard features (landuse=cemetery, amenity=grave_yard) "
-            "for a specific county or extent, with options to filter by missing Wikidata or Find A Grave identifiers."
+            "Downloads OpenStreetMap cemetery and graveyard features (landuse=cemetery, amenity=grave_yard, historic=cemetery) "
+            "as an up-to-date reference layer for a specific county or extent, with clean overwrite and ID filtering options."
         )
         self.canRunInBackground = False
 
@@ -908,7 +909,10 @@ class DownloadCemeteries(object):
             "Missing Wikidata ID ([!wikidata])",
             "Missing Find a Grave ID ([!ref:find_a_grave])",
             "Missing Either Wikidata OR Find a Grave ID",
-            "Missing Both Wikidata AND Find a Grave IDs"
+            "Missing Both Wikidata AND Find a Grave IDs",
+            "Has Find a Grave ID ([ref:find_a_grave])",
+            "Has Wikidata ID ([wikidata])",
+            "Has Both Wikidata AND Find a Grave IDs"
         ]
         param_filter.value = "All Cemeteries (No Filter)"
 
@@ -931,7 +935,16 @@ class DownloadCemeteries(object):
         )
         param_prefix.value = "OSM_Cemeteries"
 
-        return [param_method, param_county, param_extent, param_filter, param_out_gdb, param_prefix]
+        param_fresh = arcpy.Parameter(
+            displayName="Fresh Dataset (Replace / Overwrite Existing Cemeteries)",
+            name="fresh_download",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input"
+        )
+        param_fresh.value = True
+
+        return [param_method, param_county, param_extent, param_filter, param_out_gdb, param_prefix, param_fresh]
 
     def isLicensed(self):
         return True
@@ -953,6 +966,7 @@ class DownloadCemeteries(object):
         id_filter = parameters[3].valueAsText
         out_gdb = parameters[4].valueAsText
         prefix = parameters[5].valueAsText.strip() if parameters[5].value else "OSM_Cemeteries"
+        fresh_download = parameters[6].value if len(parameters) > 6 and parameters[6].value is not None else True
 
         sr_wgs84 = arcpy.SpatialReference(4326)
 
@@ -977,6 +991,7 @@ class DownloadCemeteries(object):
 
         # 2. Resolve County Area ID if county name method used
         area_id = None
+        nom_bbox = None
         if method in ["County Name (Geocoded Boundary)", "Both (County Boundary clipped to Extent)"] and county_name:
             arcpy.AddMessage(f"Resolving county boundary for '{county_name}' via Nominatim...")
             area_id, nom_bbox = resolve_nominatim_area(county_name)
@@ -988,34 +1003,37 @@ class DownloadCemeteries(object):
         # 3. Construct Overpass QL Query
         bbox_clause = f"({bbox_str})" if bbox_str else ""
         if area_id:
-            overpass_query = f"""[out:json][timeout:180];
+            overpass_query = f"""[out:json][timeout:60];
 area({area_id})->.searchArea;
 (
   nwr["landuse"="cemetery"](area.searchArea){bbox_clause};
   nwr["amenity"="grave_yard"](area.searchArea){bbox_clause};
   nwr["cemetery"](area.searchArea){bbox_clause};
+  nwr["historic"="cemetery"](area.searchArea){bbox_clause};
 );
 out meta;
 >;
 out meta qt;"""
         elif method == "Map / Layer Extent (Bounding Box)" and bbox_str:
-            overpass_query = f"""[out:json][timeout:180];
+            overpass_query = f"""[out:json][timeout:60];
 (
   nwr["landuse"="cemetery"]({bbox_str});
   nwr["amenity"="grave_yard"]({bbox_str});
   nwr["cemetery"]({bbox_str});
+  nwr["historic"="cemetery"]({bbox_str});
 );
 out meta;
 >;
 out meta qt;"""
         elif county_name:
             clean_county = county_name.split(',')[0].strip()
-            overpass_query = f"""[out:json][timeout:180];
+            overpass_query = f"""[out:json][timeout:60];
 area["name"="{clean_county}"]["admin_level"="6"]->.searchArea;
 (
   nwr["landuse"="cemetery"](area.searchArea){bbox_clause};
   nwr["amenity"="grave_yard"](area.searchArea){bbox_clause};
   nwr["cemetery"](area.searchArea){bbox_clause};
+  nwr["historic"="cemetery"](area.searchArea){bbox_clause};
 );
 out meta;
 >;
@@ -1024,21 +1042,40 @@ out meta qt;"""
             arcpy.AddError("You must provide either a County Name or a valid Map/Layer Extent.")
             return
 
+        def fetch_overpass_data(query_str, timeout_sec=40):
+            for endpoint in OVERPASS_ENDPOINTS:
+                try:
+                    arcpy.AddMessage(f"Querying Overpass endpoint: {endpoint}")
+                    req = urllib.request.Request(endpoint, data=query_str.encode('utf-8'))
+                    req.add_header('User-Agent', 'ArcGIS-Pro-OSM-Editor/1.0')
+                    with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+                        if response.status == 200:
+                            data = json.loads(response.read().decode('utf-8'))
+                            return data
+                        else:
+                            arcpy.AddMessage(f"  -> Endpoint returned HTTP status {response.status}, failing over...")
+                except Exception as e:
+                    arcpy.AddMessage(f"  -> Endpoint notice ({endpoint}): {str(e)}, failing over...")
+            return None
+
         arcpy.AddMessage("Connecting to Overpass API to query cemeteries...")
-        osm_data = None
-        for endpoint in OVERPASS_ENDPOINTS:
-            try:
-                arcpy.AddMessage(f"Querying endpoint: {endpoint}")
-                req = urllib.request.Request(endpoint, data=overpass_query.encode('utf-8'))
-                req.add_header('User-Agent', 'ArcGIS-Pro-OSM-Editor/1.0')
-                with urllib.request.urlopen(req, timeout=180) as response:
-                    if response.status == 200:
-                        osm_data = json.loads(response.read().decode('utf-8'))
-                        break
-                    else:
-                        arcpy.AddMessage(f"  -> Server returned status {response.status}, failing over...")
-            except Exception as e:
-                arcpy.AddMessage(f"  -> Endpoint notice ({str(e)}), failing over...")
+        osm_data = fetch_overpass_data(overpass_query, timeout_sec=40)
+
+        # Fallback to Nominatim bounding box query if area query timed out or failed
+        if not osm_data and nom_bbox:
+            nom_bbox_str = f"{nom_bbox[0]},{nom_bbox[2]},{nom_bbox[1]},{nom_bbox[3]}"
+            arcpy.AddMessage(f"Area query timed out. Retrying with geocoded county bounding box ({nom_bbox_str})...")
+            fallback_query = f"""[out:json][timeout:60];
+(
+  nwr["landuse"="cemetery"]({nom_bbox_str});
+  nwr["amenity"="grave_yard"]({nom_bbox_str});
+  nwr["cemetery"]({nom_bbox_str});
+  nwr["historic"="cemetery"]({nom_bbox_str});
+);
+out meta;
+>;
+out meta qt;"""
+            osm_data = fetch_overpass_data(fallback_query, timeout_sec=45)
 
         if not osm_data:
             arcpy.AddError("All Overpass API endpoints failed or timed out. Please try again in a few moments.")
@@ -1082,25 +1119,29 @@ out meta qt;"""
                 return (not has_wikidata) or (not has_fag)
             elif id_filter == "Missing Both Wikidata AND Find a Grave IDs":
                 return (not has_wikidata) and (not has_fag)
+            elif id_filter == "Has Find a Grave ID ([ref:find_a_grave])":
+                return has_fag
+            elif id_filter == "Has Wikidata ID ([wikidata])":
+                return has_wikidata
+            elif id_filter == "Has Both Wikidata AND Find a Grave IDs":
+                return has_wikidata and has_fag
             return True
 
-        # Prepare target feature classes
+        # Target reference feature classes
         pt_fc = os.path.join(out_gdb, f"{prefix}_Points")
         py_fc = os.path.join(out_gdb, f"{prefix}_Polygons")
-        top_fc = os.path.join(out_gdb, "OSM_Topology_Nodes")
 
-        # Action domain
-        domain_name = "OSM_Action_Domain"
-        try:
-            existing_domains = [d.name for d in arcpy.da.ListDomains(out_gdb)]
-            if domain_name not in existing_domains:
-                arcpy.management.CreateDomain(out_gdb, domain_name, "OpenStreetMap Upload Action", "TEXT", "CODED")
-                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "none", "None (Do not upload)")
-                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "create", "Create (New Feature)")
-                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "modify", "Modify (Edit Feature)")
-                arcpy.management.AddCodedValueToDomain(out_gdb, domain_name, "delete", "Delete (Remove Feature)")
-        except Exception:
-            pass
+        if fresh_download:
+            arcpy.AddMessage("Fresh dataset selected: removing existing cemetery layers to download clean OSM reference data...")
+            for fc in [pt_fc, py_fc]:
+                if arcpy.Exists(fc):
+                    try:
+                        arcpy.management.Delete(fc)
+                    except Exception:
+                        try:
+                            arcpy.management.TruncateTable(fc)
+                        except Exception:
+                            pass
 
         def create_cem_fc(fc, geom_type):
             if not arcpy.Exists(fc):
@@ -1126,34 +1167,12 @@ out meta qt;"""
             add_field_safely("addr_postcode", "TEXT", 20)
             add_field_safely("addr_full", "TEXT", 255)
             add_field_safely("osm_version", "LONG")
-            add_field_safely("osm_action", "TEXT", 20)
+            add_field_safely("osm_timestamp", "TEXT", 50)
+            add_field_safely("osm_user", "TEXT", 100)
             add_field_safely("osm_tags", "TEXT", 2000)
-
-            try:
-                arcpy.management.AssignDomainToField(fc, "osm_action", domain_name)
-                arcpy.management.AssignDefaultToField(fc, "osm_action", "create")
-            except Exception:
-                pass
-
-            try:
-                arcpy.management.EnableEditorTracking(
-                    fc,
-                    creator_field="created_user",
-                    creation_date_field="created_date",
-                    last_editor_field="last_edited_user",
-                    last_edit_date_field="last_edited_date",
-                    add_fields="ADD_FIELDS",
-                    record_dates_in="UTC"
-                )
-            except Exception:
-                pass
 
         create_cem_fc(pt_fc, "POINT")
         create_cem_fc(py_fc, "POLYGON")
-
-        if not arcpy.Exists(top_fc):
-            arcpy.management.CreateFeatureclass(out_gdb, "OSM_Topology_Nodes", "POINT", spatial_reference=sr_wgs84)
-            arcpy.management.AddField(top_fc, "osm_id", "TEXT", field_length=25)
 
         def get_existing_ids(fc):
             ids = set()
@@ -1164,25 +1183,17 @@ out meta qt;"""
                             ids.add(str(row[0]).strip())
             return ids
 
-        existing_pts = get_existing_ids(pt_fc)
-        existing_pys = get_existing_ids(py_fc)
-        existing_top = get_existing_ids(top_fc)
-
-        # Store topology nodes for snapping
-        nodes_to_insert = [(nid, lon, lat) for nid, (lon, lat) in nodes.items() if str(nid) not in existing_top]
-        if nodes_to_insert:
-            with arcpy.da.InsertCursor(top_fc, ["SHAPE@", "osm_id"]) as cur:
-                for nid, lon, lat in nodes_to_insert:
-                    cur.insertRow([arcpy.Point(lon, lat), str(nid)])
+        existing_pts = set() if fresh_download else get_existing_ids(pt_fc)
+        existing_pys = set() if fresh_download else get_existing_ids(py_fc)
 
         cem_fields = [
             "SHAPE@", "osm_id", "name", "cemetery_type", "wikidata", "ref_find_a_grave",
             "gnis_feature_id", "religion", "denomination", "addr_housenumber",
             "addr_street", "addr_city", "addr_state", "addr_postcode", "addr_full",
-            "osm_version", "osm_action", "osm_tags"
+            "osm_version", "osm_timestamp", "osm_user", "osm_tags"
         ]
 
-        def extract_cem_row(geom, osm_id, tags_dict, version):
+        def extract_cem_row(geom, osm_id, tags_dict, elem_meta):
             name = tags_dict.get("name", "")
             c_type = "grave_yard" if tags_dict.get("amenity") == "grave_yard" else "cemetery"
             wikidata = tags_dict.get("wikidata", "")
@@ -1198,23 +1209,27 @@ out meta qt;"""
             full = tags_dict.get("addr:full", "")
             tags_str = json.dumps(tags_dict)
 
+            version = elem_meta.get("version", 1)
+            ts = elem_meta.get("timestamp", "")
+            user = elem_meta.get("user", "")
+
             return [
                 geom, str(osm_id), name[:254], c_type[:49], wikidata[:49], fag[:49],
                 gnis[:49], religion[:49], denom[:49], hn[:49], st[:149], ct[:99],
-                state[:49], pc[:19], full[:254], int(version) if version else 1, "none",
-                tags_str[:1999]
+                state[:49], pc[:19], full[:254], int(version) if version else 1,
+                ts[:49], user[:99], tags_str[:1999]
             ]
 
         # 1. Process Points
         cemetery_points = []
         for n in tagged_nodes:
             t = n.get("tags", {})
-            if t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or "cemetery" in t:
+            if t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or "cemetery" in t or t.get("historic") == "cemetery":
                 if matches_filter(t):
                     s_id = str(n["id"])
                     if s_id not in existing_pts:
                         pt_g = arcpy.PointGeometry(arcpy.Point(n["lon"], n["lat"]), sr_wgs84)
-                        cemetery_points.append(extract_cem_row(pt_g, s_id, t, n.get("version", 1)))
+                        cemetery_points.append(extract_cem_row(pt_g, s_id, t, n))
 
         if cemetery_points:
             arcpy.AddMessage(f"Writing {len(cemetery_points)} cemetery point marker(s) into '{os.path.basename(pt_fc)}'...")
@@ -1228,7 +1243,7 @@ out meta qt;"""
 
         for w in ways:
             t = w.get("tags", {})
-            if t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or "cemetery" in t:
+            if t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or "cemetery" in t or t.get("historic") == "cemetery":
                 if matches_filter(t):
                     s_id = str(w["id"])
                     processed_way_ids.add(w["id"])
@@ -1239,12 +1254,12 @@ out meta qt;"""
                             if len(arr) >= 3:
                                 poly_g = arcpy.Polygon(arr, sr_wgs84)
                                 if poly_g and poly_g.area > 0:
-                                    cemetery_polygons.append(extract_cem_row(poly_g, s_id, t, w.get("version", 1)))
+                                    cemetery_polygons.append(extract_cem_row(poly_g, s_id, t, w))
 
         # Process Relations (multipolygons)
         for rel in relations:
             t = rel.get("tags", {})
-            if t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or "cemetery" in t:
+            if t.get("landuse") == "cemetery" or t.get("amenity") == "grave_yard" or "cemetery" in t or t.get("historic") == "cemetery":
                 if matches_filter(t):
                     s_id = str(rel["id"])
                     if s_id not in existing_pys:
@@ -1263,7 +1278,7 @@ out meta qt;"""
                         if outer_rings:
                             poly_g = arcpy.Polygon(outer_rings[0], sr_wgs84)
                             if poly_g and poly_g.area > 0:
-                                cemetery_polygons.append(extract_cem_row(poly_g, s_id, t, rel.get("version", 1)))
+                                cemetery_polygons.append(extract_cem_row(poly_g, s_id, t, rel))
 
         if cemetery_polygons:
             arcpy.AddMessage(f"Writing {len(cemetery_polygons)} cemetery boundary polygon(s) into '{os.path.basename(py_fc)}'...")
@@ -1271,28 +1286,36 @@ out meta qt;"""
                 for row in cemetery_polygons:
                     cur_py.insertRow(row)
 
-        # 3. Add to Active Map
+        # 3. Add to Active Map and Refresh Display
         try:
             aprx = arcpy.mp.ArcGISProject("CURRENT")
             active_map = aprx.activeMap
             if active_map:
-                existing_lyrs = [lyr.name for lyr in active_map.listLayers()]
                 py_name = os.path.basename(py_fc)
                 pt_name = os.path.basename(pt_fc)
 
-                if py_name not in existing_lyrs and arcpy.Exists(py_fc) and int(arcpy.management.GetCount(py_fc).getOutput(0)) > 0:
+                # Remove existing cemetery layers so ArcGIS Pro clears its display cache
+                for lyr in active_map.listLayers():
+                    if lyr.name in [py_name, pt_name]:
+                        try:
+                            active_map.removeLayer(lyr)
+                        except Exception:
+                            pass
+
+                if arcpy.Exists(py_fc) and int(arcpy.management.GetCount(py_fc).getOutput(0)) > 0:
                     active_map.addDataFromPath(py_fc)
                     arcpy.AddMessage(f"Added '{py_name}' to active map.")
-                if pt_name not in existing_lyrs and arcpy.Exists(pt_fc) and int(arcpy.management.GetCount(pt_fc).getOutput(0)) > 0:
+                if arcpy.Exists(pt_fc) and int(arcpy.management.GetCount(pt_fc).getOutput(0)) > 0:
                     active_map.addDataFromPath(pt_fc)
                     arcpy.AddMessage(f"Added '{pt_name}' to active map.")
 
                 try:
                     arcpy.RefreshActiveView()
+                    arcpy.RefreshTOC()
                 except Exception:
                     pass
         except Exception as e:
-            arcpy.AddWarning(f"Notice: Could not automatically add layer to map: {e}")
+            arcpy.AddWarning(f"Notice: Could not automatically refresh layer in map: {e}")
 
         arcpy.AddMessage(f"SUCCESS! Downloaded and indexed {len(cemetery_polygons)} polygon(s) and {len(cemetery_points)} point marker(s).")
         return
