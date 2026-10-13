@@ -92,18 +92,16 @@ def fetch_osm_elements_versions_batch(elem_type, elem_ids, token=None):
     return metadata
 
 def get_default_gdb():
-    """Dynamically resolves the default geodatabase from the active ArcGIS Pro project."""
+    """Resolves default geodatabase from workspace environment or fallback."""
     try:
-        aprx = arcpy.mp.ArcGISProject("CURRENT")
-        if aprx and aprx.defaultGeodatabase and arcpy.Exists(aprx.defaultGeodatabase):
-            return aprx.defaultGeodatabase
+        if arcpy.env.workspace and arcpy.Exists(arcpy.env.workspace):
+            return arcpy.env.workspace
     except Exception:
         pass
-    if arcpy.env.workspace and arcpy.Exists(arcpy.env.workspace):
-        return arcpy.env.workspace
     if os.path.exists(r"E:\Working_OSM\MetroToOSM.gdb"):
         return r"E:\Working_OSM\MetroToOSM.gdb"
     return ""
+
 
 def get_workspace_gdb(layer_or_path):
     """
@@ -431,7 +429,7 @@ class DownloadOSMData(object):
             parameterType="Required",
             direction="Input"
         )
-        param_extent.value = "DEFAULT"
+
 
         param_data_types = arcpy.Parameter(
             displayName="Features to Download",
@@ -479,9 +477,18 @@ class DownloadOSMData(object):
 
     def updateParameters(self, parameters):
         if not parameters[2].altered and not parameters[2].value:
-            def_gdb = get_default_gdb()
-            if def_gdb:
-                parameters[2].value = def_gdb
+            try:
+                aprx = arcpy.mp.ArcGISProject("CURRENT")
+                if aprx and aprx.defaultGeodatabase and arcpy.Exists(aprx.defaultGeodatabase):
+                    parameters[2].value = aprx.defaultGeodatabase
+                else:
+                    def_gdb = get_default_gdb()
+                    if def_gdb:
+                        parameters[2].value = def_gdb
+            except Exception:
+                def_gdb = get_default_gdb()
+                if def_gdb:
+                    parameters[2].value = def_gdb
         return
 
     def updateMessages(self, parameters):
@@ -946,7 +953,7 @@ class DownloadCemeteries(object):
             parameterType="Optional",
             direction="Input"
         )
-        param_extent.value = "DEFAULT"
+
 
         param_filter = arcpy.Parameter(
             displayName="Identifier Filter (Wikidata / Find A Grave)",
@@ -1003,9 +1010,18 @@ class DownloadCemeteries(object):
 
     def updateParameters(self, parameters):
         if not parameters[4].altered and not parameters[4].value:
-            def_gdb = get_default_gdb()
-            if def_gdb:
-                parameters[4].value = def_gdb
+            try:
+                aprx = arcpy.mp.ArcGISProject("CURRENT")
+                if aprx and aprx.defaultGeodatabase and arcpy.Exists(aprx.defaultGeodatabase):
+                    parameters[4].value = aprx.defaultGeodatabase
+                else:
+                    def_gdb = get_default_gdb()
+                    if def_gdb:
+                        parameters[4].value = def_gdb
+            except Exception:
+                def_gdb = get_default_gdb()
+                if def_gdb:
+                    parameters[4].value = def_gdb
         return
 
     def updateMessages(self, parameters):
