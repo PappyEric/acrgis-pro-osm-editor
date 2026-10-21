@@ -2,8 +2,6 @@
 
 A lightweight, no-nonsense Python Toolbox for getting OpenStreetMap (OSM) vector data in and out of ArcGIS Pro without the headache overhead.
 
-## The Deal
-
 If you've been around GIS for a while, you know the old ArcObjects OSM plugins were bloated, required massive back-end setups, and broke on every other update. This tool skips all that. We leverage vanilla Python and OSM’s REST API (Overpass/OAuth 2.0) to directly sync your local File Geodatabase with the live map.
 
 You get four tools:
@@ -87,4 +85,3 @@ We built a backend topology cache that tries to snap your new vertices into the 
 - ✅ **Good for:** Straight-up deleting bad features.
 - ❌ **Avoid:** Bulldozing or doing heavy geometric realignment of massive, interconnected highways. If you're doing complex road networking, boot up JOSM so you don't crater the topological network.
 - ❌ **Note:** The Cemetery tool is strictly a reference/audit layer; it does not build topology nodes and is not intended for pushing geometry edits back via `UploadOSMData`.
-
