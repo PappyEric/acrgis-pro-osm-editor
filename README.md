@@ -9,7 +9,7 @@ If you've been around GIS for a while, you know the old ArcObjects OSM plugins w
 You get four tools:
 
 1. **Download OSM Data To Current View**: Grabs whatever's in your active map extent. It rips the JSON apart, dumps it cleanly into native Points, Lines, and Polygons, and builds a hidden topology node backbone so things actually snap together properly.
-2. **Download OSM Cemeteries by County**: Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`, `cemetery=*`, `historic=cemetery`). Operates as a pure, lightweight reference layer with clean dataset overwriting, live OSM user/timestamp attribution, multi-endpoint Overpass failover with bounding box fallback, and identifier filters (Wikidata / Find A Grave).
+2. **Download OSM Cemeteries by County**: (This is a niche tool for a cememtery location project)Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`, `cemetery=*`, `historic=cemetery`). Operates as a pure, lightweight reference layer with clean dataset overwriting, live OSM user/timestamp attribution, multi-endpoint Overpass failover with bounding box fallback, and identifier filters (Wikidata / Find A Grave).
 3. **Tag OSM Buildings from Address & Name Points**: Performs an in-memory point-in-polygon spatial join between your GIS address / structure name points and the OSM building footprint polygons. Maps addresses into standard OSM `addr:*` tags and structure names into `name`, ready for upload.
 4. **Upload Edits to OSM**: Scans your local edits, converts them back to `osmChange` XML packets, and pushes them to your OSM account.
 
@@ -36,6 +36,7 @@ When you download data, the script automatically parses out the core OSM tags (`
 ### 2. Spatial Address & Name Enrichment
 
 Have an authoritative local SDE/FileGDB layer of site address points or building names?
+
 - Run **Tag OSM Buildings from Address & Name Points**.
 - Select your `OSM_Polygons` layer and your point layers directly from your active map.
 - Map the fields (House Number, Street Name, Unit, City, ZIP, Common Name).
@@ -45,6 +46,7 @@ Have an authoritative local SDE/FileGDB layer of site address points or building
 ### 3. Dedicated Cemetery Reference Layers
 
 Need up-to-date cemetery polygons and markers for local ground-truthing, research, or audit work?
+
 - Run **Download OSM Cemeteries by County**.
 - **County Geocoding or Map Extent:** Choose a county name (e.g. `Cabell County, West Virginia`) or an active map/layer extent.
 - **Fresh Dataset Overwrite:** Enabled by default. Wipes existing cemetery layers (`OSM_Cemeteries_Points` and `OSM_Cemeteries_Polygons`) and pulls a clean, authoritative snapshot directly from OSM—preventing stale ghost records or append duplicates.
@@ -68,7 +70,7 @@ We removed the need for you to manually flag every row you touch in editable OSM
 
 - **Modifying:** When you move a vertex or change a dropdown value, ArcGIS natively logs the `last_edited_date`. The Upload script checks that timestamp against the creation date. If you touched it, the script knows, and auto-tags it as an OSM `<modify>` under the hood.
 - **Digitizing:** Creating a new trail or building? We bound the Default Value of the `osm_action` column to `"create"`. Sketch a new feature and it's flagged as brand-new out of the gate.
-- **Deleting:** If a building needs to be nuked, hit the `osm_action` dropdown and set it to `delete`.
+- **Deleting:** If a building needs to be nuked, hit the `osm_action` dropdown and set it to `delete`. Don't delete it from the GIS layer: OSM needs to see the 'delete' flag on upload.
 
 ## Limitations & Best Practices
 

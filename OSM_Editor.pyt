@@ -9,14 +9,152 @@ import os
 import json
 import re
 import time
+import gzip
 from xml.sax.saxutils import escape
 import xml.etree.ElementTree as ET
+
+USER_AGENT = 'ArcGIS-Pro-OSM-Editor/1.0'
 
 def xml_escape_attr(val):
     """Escapes XML special characters including quotes for attribute values."""
     if val is None:
         return ""
     return escape(str(val), entities={'"': "&quot;", "'": "&apos;"})
+
+def read_http_body(resp):
+    """Reads an HTTP response body, transparently decompressing gzip payloads."""
+    data = resp.read()
+    if (resp.headers.get('Content-Encoding') or '').lower() == 'gzip':
+        data = gzip.decompress(data)
+    return data.decode('utf-8')
+
+def classify_osm_type(tags_dict, default="unknown"):
+    """Returns a primary OSM feature category from a tag dictionary using a fixed priority order."""
+    if "highway" in tags_dict: return "highway"
+    if "building" in tags_dict: return "building"
+    if "amenity" in tags_dict: return "amenity"
+    if "shop" in tags_dict: return "shop"
+    if "waterway" in tags_dict or tags_dict.get("natural") == "water": return "water"
+    if "landuse" in tags_dict: return "landuse"
+    if "railway" in tags_dict: return "railway"
+    if "boundary" in tags_dict: return "boundary"
+    if "power" in tags_dict: return "power"
+    if "tourism" in tags_dict or "historic" in tags_dict: return "tourism"
+    if "natural" in tags_dict: return "natural"
+    if "barrier" in tags_dict: return "barrier"
+    if "emergency" in tags_dict: return "emergency"
+    if "public_transport" in tags_dict: return "public_transport"
+    for k in tags_dict:
+        if not k.startswith("addr:"):
+            return str(k)
+    return "address" if tags_dict else default
+
+def build_osm_feature_row(geom, str_id, tags_dict, version=1, default_type=None):
+    """Constructs a standard 21-element row tuple matching the OSM feature class schema."""
+    tags_dict = tags_dict or {}
+    tags_str = json.dumps(tags_dict)
+    name = tags_dict.get("name", "")
+    osm_type = classify_osm_type(tags_dict, default=default_type) if default_type else classify_osm_type(tags_dict)
+
+    hw = tags_dict.get("highway", "")
+    bd = tags_dict.get("building", "")
+    nt = tags_dict.get("natural", "")
+    ww = tags_dict.get("waterway", "")
+    am = tags_dict.get("amenity", "")
+    lu = tags_dict.get("landuse", "")
+    ls = tags_dict.get("leisure", "")
+
+    addr_hn = tags_dict.get("addr:housenumber", "")
+    addr_st = tags_dict.get("addr:street", "")
+    addr_un = tags_dict.get("addr:unit", tags_dict.get("addr:flats", tags_dict.get("addr:suite", "")))
+    addr_ct = tags_dict.get("addr:city", "")
+    addr_state_val = tags_dict.get("addr:state", "")
+    addr_pc = tags_dict.get("addr:postcode", "")
+    addr_fl = tags_dict.get("addr:full", "")
+
+    return [
+        geom, str_id, name[:254], osm_type[:49], tags_str[:1999], int(version) if version else 1, "none",
+        hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149],
+        addr_hn[:49], addr_st[:149], addr_un[:49], addr_ct[:99], addr_state_val[:49], addr_pc[:19], addr_fl[:254]
+    ]
+
+def assemble_multipolygon_geometry(rel, way_dict, nodes, sr):
+    """
+    Assembles an arcpy.Polygon geometry from an OSM multipolygon relation's member ways.
+    Handles multiple outer and inner rings, linking connected way segments.
+    """
+    members = rel.get("members", [])
+    if not members:
+        return None
+
+    outer_way_ids = [m["ref"] for m in members if m.get("type") == "way" and m.get("role") in ("outer", "")]
+    inner_way_ids = [m["ref"] for m in members if m.get("type") == "way" and m.get("role") == "inner"]
+
+    if not outer_way_ids:
+        return None
+
+    def ways_to_rings(way_ids):
+        segments = []
+        for wid in way_ids:
+            w = way_dict.get(wid)
+            if not w:
+                continue
+            wnodes = [nodes[nid] for nid in w.get("nodes", []) if nid in nodes]
+            if len(wnodes) >= 2:
+                segments.append(wnodes)
+
+        if not segments:
+            return []
+
+        rings = []
+        while segments:
+            current_ring = list(segments.pop(0))
+            changed = True
+            while changed and current_ring[0] != current_ring[-1]:
+                changed = False
+                for i, seg in enumerate(segments):
+                    if current_ring[-1] == seg[0]:
+                        current_ring.extend(seg[1:])
+                        segments.pop(i)
+                        changed = True
+                        break
+                    elif current_ring[-1] == seg[-1]:
+                        current_ring.extend(reversed(seg[:-1]))
+                        segments.pop(i)
+                        changed = True
+                        break
+                    elif current_ring[0] == seg[-1]:
+                        current_ring = list(seg[:-1]) + current_ring
+                        segments.pop(i)
+                        changed = True
+                        break
+                    elif current_ring[0] == seg[0]:
+                        current_ring = list(reversed(seg[1:])) + current_ring
+                        segments.pop(i)
+                        changed = True
+                        break
+
+            if len(current_ring) >= 3:
+                if current_ring[0] != current_ring[-1]:
+                    current_ring.append(current_ring[0])
+                arr = arcpy.Array([arcpy.Point(pt[0], pt[1]) for pt in current_ring])
+                rings.append(arr)
+
+        return rings
+
+    outer_rings = ways_to_rings(outer_way_ids)
+    if not outer_rings:
+        return None
+
+    inner_rings = ways_to_rings(inner_way_ids)
+    all_rings = arcpy.Array(outer_rings + inner_rings)
+    try:
+        geom = arcpy.Polygon(all_rings, sr)
+        if geom and geom.area > 0:
+            return geom
+    except Exception:
+        pass
+    return None
 
 def fetch_osm_element_version(elem_type, elem_id, token=None):
     """Queries the OSM API to retrieve the latest live version number of a node/way/relation."""
@@ -92,14 +230,18 @@ def fetch_osm_elements_versions_batch(elem_type, elem_ids, token=None):
     return metadata
 
 def get_default_gdb():
-    """Resolves default geodatabase from workspace environment or fallback."""
+    """Resolves default geodatabase from active project or workspace environment."""
+    try:
+        aprx = arcpy.mp.ArcGISProject("CURRENT")
+        if aprx and aprx.defaultGeodatabase and arcpy.Exists(aprx.defaultGeodatabase):
+            return aprx.defaultGeodatabase
+    except Exception:
+        pass
     try:
         if arcpy.env.workspace and arcpy.Exists(arcpy.env.workspace):
             return arcpy.env.workspace
     except Exception:
         pass
-    if os.path.exists(r"E:\Working_OSM\MetroToOSM.gdb"):
-        return r"E:\Working_OSM\MetroToOSM.gdb"
     return ""
 
 
@@ -281,6 +423,8 @@ NAME_EXPANSIONS = {
 }
 
 ROMAN_NUMERALS = {"II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"}
+_ORDINAL_RE = re.compile(r'^(\d+)(ST|ND|RD|TH)$')
+_LETTER_NUM_RE = re.compile(r'^\d+[A-Z]$')
 LOWERCASE_WORDS = {"of", "and", "the", "at", "in", "for", "on", "by", "de", "la", "van", "von", "to"}
 
 def format_word_title_case(word, is_first=False):
@@ -297,7 +441,7 @@ def format_word_title_case(word, is_first=False):
         return upper + punctuation
 
     # Ordinal Numbers: 1ST -> 1st, 2ND -> 2nd, 23RD -> 23rd, 4TH -> 4th
-    ord_match = re.match(r'^(\d+)(ST|ND|RD|TH)$', upper)
+    ord_match = _ORDINAL_RE.match(upper)
     if ord_match:
         return f"{ord_match.group(1)}{ord_match.group(2).lower()}{punctuation}"
 
@@ -306,7 +450,7 @@ def format_word_title_case(word, is_first=False):
         return upper.lower() + punctuation
 
     # Letter-number combinations (e.g. 3B, 4A)
-    if re.match(r'^\d+[A-Z]$', upper):
+    if _LETTER_NUM_RE.match(upper):
         return upper + punctuation
 
     # Standard Title Case (handling internal apostrophes or hyphens)
@@ -394,8 +538,18 @@ def normalize_osm_city(raw_city):
 
 
 # --- Configuration ---
-# Hardcoded fallback Bearer Token (can be overridden via tool parameter or OSM_BEARER_TOKEN env var)
-OSM_BEARER_TOKEN = "your_personal_access_token_here"
+# The Bearer Token is NEVER stored in source. Resolution order:
+#   1. Tool parameter  2. OSM_BEARER_TOKEN environment variable  3. git-ignored 'osm_token.txt' next to this toolbox
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osm_token.txt")
+
+def _load_token_file():
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+OSM_BEARER_TOKEN = os.environ.get("OSM_BEARER_TOKEN", "").strip() or _load_token_file()
 
 # OSM API Endpoints
 OVERPASS_ENDPOINTS = [
@@ -405,6 +559,23 @@ OVERPASS_ENDPOINTS = [
     "https://z.overpass-api.de/api/interpreter"
 ]
 OSM_API_URL = "https://api.openstreetmap.org/api/0.6/"
+
+def query_overpass(query_str, timeout_sec=180):
+    """Executes an Overpass QL query across failover endpoints with gzip compression support."""
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            arcpy.AddMessage(f"Connecting to Overpass endpoint: {endpoint}")
+            req = urllib.request.Request(endpoint, data=query_str.encode('utf-8'))
+            req.add_header('User-Agent', USER_AGENT)
+            req.add_header('Accept-Encoding', 'gzip')
+            with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+                if response.status == 200:
+                    return json.loads(read_http_body(response))
+                else:
+                    arcpy.AddMessage(f"  -> Server busy (Status {response.status}), failing over to backup...")
+        except Exception as e:
+            arcpy.AddMessage(f"  -> Endpoint notice ({endpoint}): {str(e)}, failing over to backup...")
+    return None
 
 
 class Toolbox(object):
@@ -467,7 +638,7 @@ class DownloadOSMData(object):
             direction="Input"
         )
         def_gdb = get_default_gdb()
-        param_out_gdb.value = def_gdb if def_gdb else r"E:\Working_OSM\MetroToOSM.gdb"
+        param_out_gdb.value = def_gdb or ""
 
         params = [param_extent, param_data_types, param_out_gdb]
         return params
@@ -568,20 +739,7 @@ out meta;
 out meta qt;"""
 
         arcpy.AddMessage("Constructed Overpass Query. Executing...")
-        osm_data = None
-        for endpoint in OVERPASS_ENDPOINTS:
-            try:
-                arcpy.AddMessage(f"Connecting to Overpass endpoint: {endpoint}")
-                req = urllib.request.Request(endpoint, data=overpass_query.encode('utf-8'))
-                req.add_header('User-Agent', 'ArcGIS-Pro-OSM-Editor/1.0')
-                with urllib.request.urlopen(req, timeout=180) as response:
-                    if response.status == 200:
-                        osm_data = json.loads(response.read().decode('utf-8'))
-                        break
-                    else:
-                        arcpy.AddMessage(f"  -> Server busy (Status {response.status}), failing over to backup...")
-            except Exception as e:
-                arcpy.AddMessage(f"  -> Server busy ({str(e)}), failing over to backup...")
+        osm_data = query_overpass(overpass_query, timeout_sec=180)
 
         if not osm_data:
             arcpy.AddError("All Overpass API endpoints failed (Server too busy). Please try again in a few minutes or zoom in a bit closer.")
@@ -596,15 +754,21 @@ out meta qt;"""
 
         nodes = {}
         ways = []
+        relations = []
+        way_dict = {}
         tagged_nodes = []
 
         for el in elements:
-            if el["type"] == "node":
+            el_type = el.get("type")
+            if el_type == "node":
                 nodes[el["id"]] = (el["lon"], el["lat"])
                 if "tags" in el:
                     tagged_nodes.append(el)
-            elif el["type"] == "way":
+            elif el_type == "way":
                 ways.append(el)
+                way_dict[el["id"]] = el
+            elif el_type == "relation":
+                relations.append(el)
 
         pt_fc = os.path.join(out_gdb, "OSM_Points")
         ln_fc = os.path.join(out_gdb, "OSM_Lines")
@@ -643,23 +807,31 @@ out meta qt;"""
             if not arcpy.Exists(fc):
                 arcpy.management.CreateFeatureclass(out_gdb, os.path.basename(fc), geom_type, spatial_reference=sr_wgs84)
 
-            existing_fields = [f.name for f in arcpy.ListFields(fc)]
+            # Field objects keyed by name; schema GP tools only run when something is actually missing
+            existing_fields = {f.name: f for f in arcpy.ListFields(fc)}
             def add_field_safely(fname, ftype, flen=None):
+                """Adds the field if missing. Returns True when the field was newly created."""
                 if fname not in existing_fields:
                     arcpy.management.AddField(fc, fname, ftype, field_length=flen)
+                    return True
+                return False
+
+            def needs_domain(fname, added, dom):
+                return added or getattr(existing_fields.get(fname), "domain", "") != dom
 
             add_field_safely("osm_id", "TEXT", 25)
             add_field_safely("name", "TEXT", 255)
             add_field_safely("osm_type", "TEXT", 50)
             add_field_safely("osm_tags", "TEXT", 2000)
             add_field_safely("osm_version", "LONG")
-            add_field_safely("osm_action", "TEXT", 20)
+            action_added = add_field_safely("osm_action", "TEXT", 20)
 
-            try:
-                arcpy.management.AssignDomainToField(fc, "osm_action", domain_name)
-                arcpy.management.AssignDefaultToField(fc, "osm_action", "create")
-            except Exception:
-                pass
+            if needs_domain("osm_action", action_added, domain_name):
+                try:
+                    arcpy.management.AssignDomainToField(fc, "osm_action", domain_name)
+                    arcpy.management.AssignDefaultToField(fc, "osm_action", "create")
+                except Exception:
+                    pass
 
             for sem_field, dom_binding in [("highway", "OSM_Highway_Domain"), ("building", "OSM_Building_Domain"), 
                                            ("natural", "OSM_Natural_Domain"), ("waterway", "OSM_Waterway_Domain"), 
@@ -669,18 +841,20 @@ out meta qt;"""
                                            ("addr_unit", None), ("addr_city", None),
                                            ("addr_state", None), ("addr_postcode", None), ("addr_full", None)]:
                 flen = 255 if sem_field in ["name", "addr_street", "addr_full"] else (50 if sem_field in ["addr_housenumber", "addr_unit", "addr_state", "addr_postcode"] else 150)
-                add_field_safely(sem_field, "TEXT", flen)
-                if dom_binding:
+                sem_added = add_field_safely(sem_field, "TEXT", flen)
+                if dom_binding and needs_domain(sem_field, sem_added, dom_binding):
                     try:
                         arcpy.management.AssignDomainToField(fc, sem_field, dom_binding)
                     except Exception:
                         pass
+                if geom_type == "POLYGON" and sem_field == "building" and sem_added:
+                    try:
+                        arcpy.management.AssignDefaultToField(fc, "building", "yes")
+                    except Exception:
+                        pass
 
-            if geom_type == "POLYGON":
-                try:
-                    arcpy.management.AssignDefaultToField(fc, "building", "yes")
-                except Exception:
-                    pass
+            if "created_user" in existing_fields:
+                return  # Editor tracking already configured
 
             try:
                 arcpy.management.EnableEditorTracking(
@@ -704,13 +878,10 @@ out meta qt;"""
             arcpy.management.AddField(top_fc, "osm_id", "TEXT", field_length=25)
 
         def get_existing_ids(fc):
-            ids = set()
-            if arcpy.Exists(fc) and int(arcpy.management.GetCount(fc).getOutput(0)) > 0:
-                with arcpy.da.SearchCursor(fc, ["osm_id"]) as cur:
-                    for row in cur:
-                        if row[0]:
-                            ids.add(row[0])
-            return ids
+            if not arcpy.Exists(fc):
+                return set()
+            with arcpy.da.SearchCursor(fc, ["osm_id"]) as cur:
+                return {row[0] for row in cur if row[0]}
 
         existing_pts = get_existing_ids(pt_fc)
         existing_lns = get_existing_ids(ln_fc)
@@ -765,118 +936,72 @@ out meta qt;"""
 
                     pt = arcpy.PointGeometry(arcpy.Point(n["lon"], n["lat"]), sr_wgs84)
                     tags_dict_val = n.get("tags", {})
-                    tags = json.dumps(tags_dict_val)
-                    name = tags_dict_val.get("name", "")
-                    osm_type = "amenity" if "amenity" in tags_dict_val else str(list(tags_dict_val.keys())[0] if tags_dict_val else "node")
-                    version = n.get("version", 1)
-
-                    hw = tags_dict_val.get("highway", "")
-                    bd = tags_dict_val.get("building", "")
-                    nt = tags_dict_val.get("natural", "")
-                    ww = tags_dict_val.get("waterway", "")
-                    am = tags_dict_val.get("amenity", "")
-                    lu = tags_dict_val.get("landuse", "")
-                    ls = tags_dict_val.get("leisure", "")
-
-                    addr_hn = tags_dict_val.get("addr:housenumber", "")
-                    addr_st = tags_dict_val.get("addr:street", "")
-                    addr_un = tags_dict_val.get("addr:unit", tags_dict_val.get("addr:flats", tags_dict_val.get("addr:suite", "")))
-                    addr_ct = tags_dict_val.get("addr:city", "")
-                    addr_state_val = tags_dict_val.get("addr:state", "")
-                    addr_pc = tags_dict_val.get("addr:postcode", "")
-                    addr_fl = tags_dict_val.get("addr:full", "")
-
-                    cursor.insertRow([pt, str_id, name[:254], osm_type[:49], tags[:1999], version, "none",
-                                      hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149],
-                                      addr_hn[:49], addr_st[:149], addr_un[:49], addr_ct[:99], addr_state_val[:49], addr_pc[:19], addr_fl[:254]])
+                    cursor.insertRow(build_osm_feature_row(pt, str_id, tags_dict_val, version=n.get("version", 1), default_type="node"))
 
         if ways:
-            arcpy.AddMessage(f"Processing {len(ways)} Lines and Polygons...")
-            line_rows = []
-            poly_rows = []
+            arcpy.AddMessage(f"Processing and streaming {len(ways)} Lines and Polygons...")
+            written_lines = 0
+            written_polys = 0
 
-            for w in ways:
-                node_refs = w.get("nodes", [])
-                if len(node_refs) < 2:
-                    continue
-
-                arr = arcpy.Array([arcpy.Point(nodes[nid][0], nodes[nid][1]) for nid in node_refs if nid in nodes])
-                if len(arr) < 2:
-                    continue
-
-                str_id = str(w["id"])
-                tags_dict = w.get("tags", {})
-                tags_str = json.dumps(tags_dict)
-                name = tags_dict.get("name", "")
-                osm_type = "unknown"
-                if "highway" in tags_dict: osm_type = "highway"
-                elif "building" in tags_dict: osm_type = "building"
-                elif "amenity" in tags_dict: osm_type = "amenity"
-                elif "shop" in tags_dict: osm_type = "shop"
-                elif "waterway" in tags_dict or tags_dict.get("natural") == "water": osm_type = "water"
-                elif "landuse" in tags_dict: osm_type = "landuse"
-                elif "railway" in tags_dict: osm_type = "railway"
-                elif "boundary" in tags_dict: osm_type = "boundary"
-                elif "power" in tags_dict: osm_type = "power"
-                elif "tourism" in tags_dict or "historic" in tags_dict: osm_type = "tourism"
-                elif "natural" in tags_dict: osm_type = "natural"
-                elif "barrier" in tags_dict: osm_type = "barrier"
-                elif "emergency" in tags_dict: osm_type = "emergency"
-                elif tags_dict: osm_type = str(list(tags_dict.keys())[0])
-
-                version = w.get("version", 1)
-
-                is_closed = (node_refs[0] == node_refs[-1])
-                line_keys = ["highway", "barrier", "waterway", "railway", "power", "boundary"]
-                force_line = any(k in tags_dict for k in line_keys)
-
-                poly_keys = ["building", "leisure", "landuse", "amenity", "natural", "shop", "tourism", "historic"]
-                force_poly = any(k in tags_dict for k in poly_keys)
-
-                hw = tags_dict.get("highway", "")
-                bd = tags_dict.get("building", "")
-                nt = tags_dict.get("natural", "")
-                ww = tags_dict.get("waterway", "")
-                am = tags_dict.get("amenity", "")
-                lu = tags_dict.get("landuse", "")
-                ls = tags_dict.get("leisure", "")
-
-                addr_hn = tags_dict.get("addr:housenumber", "")
-                addr_st = tags_dict.get("addr:street", "")
-                addr_un = tags_dict.get("addr:unit", tags_dict.get("addr:flats", tags_dict.get("addr:suite", "")))
-                addr_ct = tags_dict.get("addr:city", "")
-                addr_state_val = tags_dict.get("addr:state", "")
-                addr_pc = tags_dict.get("addr:postcode", "")
-                addr_fl = tags_dict.get("addr:full", "")
-
-                if is_closed and (force_poly or tags_dict.get("area") == "yes") and not force_line:
-                    if str_id in existing_pys:
+            with arcpy.da.InsertCursor(ln_fc, fields) as cursor_ln, arcpy.da.InsertCursor(py_fc, fields) as cursor_py:
+                for w in ways:
+                    node_refs = w.get("nodes", [])
+                    if len(node_refs) < 2:
                         continue
-                    geom = arcpy.Polygon(arr, sr_wgs84)
+
+                    arr = arcpy.Array([arcpy.Point(nodes[nid][0], nodes[nid][1]) for nid in node_refs if nid in nodes])
+                    if len(arr) < 2:
+                        continue
+
+                    str_id = str(w["id"])
+                    tags_dict = w.get("tags", {})
+                    version = w.get("version", 1)
+
+                    is_closed = (node_refs[0] == node_refs[-1])
+                    line_keys = ["highway", "barrier", "waterway", "railway", "power", "boundary"]
+                    force_line = any(k in tags_dict for k in line_keys)
+
+                    poly_keys = ["building", "leisure", "landuse", "amenity", "natural", "shop", "tourism", "historic"]
+                    force_poly = any(k in tags_dict for k in poly_keys)
+
+                    if is_closed and (force_poly or tags_dict.get("area") == "yes") and not force_line:
+                        if str_id in existing_pys:
+                            continue
+                        geom = arcpy.Polygon(arr, sr_wgs84)
+                        if geom and geom.area > 0:
+                            cursor_py.insertRow(build_osm_feature_row(geom, str_id, tags_dict, version=version))
+                            written_polys += 1
+                    else:
+                        if str_id in existing_lns:
+                            continue
+                        geom = arcpy.Polyline(arr, sr_wgs84)
+                        if geom and geom.length > 0:
+                            cursor_ln.insertRow(build_osm_feature_row(geom, str_id, tags_dict, version=version))
+                            written_lines += 1
+
+            arcpy.AddMessage(f"-> Inserted {written_lines} Line(s) and {written_polys} Polygon(s).")
+
+        if relations:
+            arcpy.AddMessage(f"Processing {len(relations)} OSM relations (multipolygons)...")
+            written_rels = 0
+            with arcpy.da.InsertCursor(py_fc, fields) as cursor_py:
+                for rel in relations:
+                    rel_tags = rel.get("tags", {})
+                    area_keys = ["building", "landuse", "leisure", "amenity", "natural", "boundary", "waterway"]
+                    if not any(k in rel_tags for k in area_keys) and rel_tags.get("type") != "multipolygon":
+                        continue
+
+                    str_id = f"r{rel['id']}"
+                    if str_id in existing_pys or str(rel["id"]) in existing_pys:
+                        continue
+
+                    geom = assemble_multipolygon_geometry(rel, way_dict, nodes, sr_wgs84)
                     if geom and geom.area > 0:
-                        poly_rows.append([geom, str_id, name[:254], osm_type[:49], tags_str[:1999], version, "none",
-                                          hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149],
-                                          addr_hn[:49], addr_st[:149], addr_un[:49], addr_ct[:99], addr_state_val[:49], addr_pc[:19], addr_fl[:254]])
-                else:
-                    if str_id in existing_lns:
-                        continue
-                    geom = arcpy.Polyline(arr, sr_wgs84)
-                    if geom and geom.length > 0:
-                        line_rows.append([geom, str_id, name[:254], osm_type[:49], tags_str[:1999], version, "none",
-                                          hw[:149], bd[:149], nt[:149], ww[:149], am[:149], lu[:149], ls[:149],
-                                          addr_hn[:49], addr_st[:149], addr_un[:49], addr_ct[:99], addr_state_val[:49], addr_pc[:19], addr_fl[:254]])
+                        cursor_py.insertRow(build_osm_feature_row(geom, str_id, rel_tags, version=rel.get("version", 1), default_type="relation"))
+                        written_rels += 1
 
-            if line_rows:
-                arcpy.AddMessage(f"Writing {len(line_rows)} Lines...")
-                with arcpy.da.InsertCursor(ln_fc, fields) as cursor_ln:
-                    for row in line_rows:
-                        cursor_ln.insertRow(row)
-
-            if poly_rows:
-                arcpy.AddMessage(f"Writing {len(poly_rows)} Polygons...")
-                with arcpy.da.InsertCursor(py_fc, fields) as cursor_py:
-                    for row in poly_rows:
-                        cursor_py.insertRow(row)
+            if written_rels > 0:
+                arcpy.AddMessage(f"-> Inserted {written_rels} Multipolygon relation(s) into OSM_Polygons.")
 
         try:
             aprx = arcpy.mp.ArcGISProject("CURRENT")
@@ -944,7 +1069,7 @@ class DownloadCemeteries(object):
             parameterType="Optional",
             direction="Input"
         )
-        param_county.value = "Cabell County, West Virginia"
+        param_county.value = ""
 
         param_extent = arcpy.Parameter(
             displayName="Search Extent (Map View / Layer Extent)",
@@ -983,7 +1108,7 @@ class DownloadCemeteries(object):
             direction="Input"
         )
         def_gdb = get_default_gdb()
-        param_out_gdb.value = def_gdb if def_gdb else r"E:\Working_OSM\MetroToOSM.gdb"
+        param_out_gdb.value = def_gdb or ""
 
         param_prefix = arcpy.Parameter(
             displayName="Output Feature Class Prefix",
@@ -1110,24 +1235,8 @@ out meta qt;"""
             arcpy.AddError("You must provide either a County Name or a valid Map/Layer Extent.")
             return
 
-        def fetch_overpass_data(query_str, timeout_sec=40):
-            for endpoint in OVERPASS_ENDPOINTS:
-                try:
-                    arcpy.AddMessage(f"Querying Overpass endpoint: {endpoint}")
-                    req = urllib.request.Request(endpoint, data=query_str.encode('utf-8'))
-                    req.add_header('User-Agent', 'ArcGIS-Pro-OSM-Editor/1.0')
-                    with urllib.request.urlopen(req, timeout=timeout_sec) as response:
-                        if response.status == 200:
-                            data = json.loads(response.read().decode('utf-8'))
-                            return data
-                        else:
-                            arcpy.AddMessage(f"  -> Endpoint returned HTTP status {response.status}, failing over...")
-                except Exception as e:
-                    arcpy.AddMessage(f"  -> Endpoint notice ({endpoint}): {str(e)}, failing over...")
-            return None
-
         arcpy.AddMessage("Connecting to Overpass API to query cemeteries...")
-        osm_data = fetch_overpass_data(overpass_query, timeout_sec=40)
+        osm_data = query_overpass(overpass_query, timeout_sec=40)
 
         # Fallback to Nominatim bounding box query if area query timed out or failed
         if not osm_data and nom_bbox:
@@ -1143,7 +1252,7 @@ out meta qt;"""
 out meta;
 >;
 out meta qt;"""
-            osm_data = fetch_overpass_data(fallback_query, timeout_sec=45)
+            osm_data = query_overpass(fallback_query, timeout_sec=45)
 
         if not osm_data:
             arcpy.AddError("All Overpass API endpoints failed or timed out. Please try again in a few moments.")
@@ -1243,13 +1352,10 @@ out meta qt;"""
         create_cem_fc(py_fc, "POLYGON")
 
         def get_existing_ids(fc):
-            ids = set()
-            if arcpy.Exists(fc) and int(arcpy.management.GetCount(fc).getOutput(0)) > 0:
-                with arcpy.da.SearchCursor(fc, ["osm_id"]) as cur:
-                    for row in cur:
-                        if row[0]:
-                            ids.add(str(row[0]).strip())
-            return ids
+            if not arcpy.Exists(fc):
+                return set()
+            with arcpy.da.SearchCursor(fc, ["osm_id"]) as cur:
+                return {str(row[0]).strip() for row in cur if row[0]}
 
         existing_pts = set() if fresh_download else get_existing_ids(pt_fc)
         existing_pys = set() if fresh_download else get_existing_ids(py_fc)
@@ -1331,22 +1437,9 @@ out meta qt;"""
                 if matches_filter(t):
                     s_id = str(rel["id"])
                     if s_id not in existing_pys:
-                        members = rel.get("members", [])
-                        outer_rings = []
-                        for m in members:
-                            if m.get("type") == "way" and m.get("role") in ["outer", ""]:
-                                w_id = m.get("ref")
-                                if w_id in way_dict:
-                                    w_elem = way_dict[w_id]
-                                    w_nodes = w_elem.get("nodes", [])
-                                    if len(w_nodes) >= 3:
-                                        w_arr = arcpy.Array([arcpy.Point(nodes[nid][0], nodes[nid][1]) for nid in w_nodes if nid in nodes])
-                                        if len(w_arr) >= 3:
-                                            outer_rings.append(w_arr)
-                        if outer_rings:
-                            poly_g = arcpy.Polygon(outer_rings[0], sr_wgs84)
-                            if poly_g and poly_g.area > 0:
-                                cemetery_polygons.append(extract_cem_row(poly_g, s_id, t, rel))
+                        poly_g = assemble_multipolygon_geometry(rel, way_dict, nodes, sr_wgs84)
+                        if poly_g and poly_g.area > 0:
+                            cemetery_polygons.append(extract_cem_row(poly_g, s_id, t, rel))
 
         if cemetery_polygons:
             arcpy.AddMessage(f"Writing {len(cemetery_polygons)} cemetery boundary polygon(s) into '{os.path.basename(py_fc)}'...")
@@ -1448,37 +1541,57 @@ class UploadOSMData(object):
 
         arcpy.AddMessage("Validating credentials...")
         if not active_token or active_token == "your_personal_access_token_here":
-            arcpy.AddError("OSM Personal Access Token is missing. Provide it in the tool parameter, set the OSM_BEARER_TOKEN environment variable, or update OSM_Editor.pyt.")
+            arcpy.AddError("OSM Personal Access Token is missing. Provide it in the tool parameter, set the OSM_BEARER_TOKEN environment variable, or run get_osm_token.py to create osm_token.txt.")
             return
 
+        # Single pre-scan: counts edits AND collects existing IDs whose live versions must be synced
         edited_features_count = 0
+        existing_ways = set()
+        existing_nodes = set()
         arcpy.AddMessage("Scanning selected features for manual OSM edits and auto-detecting spatial modifications...")
 
         for layer in in_layers:
-            if arcpy.Exists(layer):
-                desc = arcpy.Describe(layer)
-                has_editor_tracking = getattr(desc, 'editorTrackingEnabled', False)
-                c_field = getattr(desc, 'creationDateField', "")
-                e_field = getattr(desc, 'editDateField', "")
+            if not arcpy.Exists(layer):
+                continue
+            desc = arcpy.Describe(layer)
+            g_type = desc.shapeType
+            all_flds = [f.name for f in arcpy.ListFields(layer)]
+            if "osm_action" not in all_flds:
+                continue
+            has_id = "osm_id" in all_flds
+            s_flds = ["osm_action", "osm_id" if has_id else "OID@"]
+            has_et = getattr(desc, 'editorTrackingEnabled', False)
+            c_f = getattr(desc, 'creationDateField', "")
+            e_f = getattr(desc, 'editDateField', "")
+            if has_et and c_f and e_f and c_f in all_flds and e_f in all_flds:
+                s_flds.extend([c_f, e_f])
 
-                s_fields = ["osm_action"]
-                if has_editor_tracking and c_field and e_field:
-                    s_fields.extend([c_field, e_field])
-
-                with arcpy.da.SearchCursor(layer, s_fields) as cur:
-                    for row in cur:
-                        action = row[0]
-                        if action in ['create', 'modify', 'delete']:
-                            edited_features_count += 1
-                        elif has_editor_tracking and len(row) > 1:
-                            c_date, e_date = row[1], row[2]
-                            if c_date and e_date and (e_date - c_date).total_seconds() > 2.0:
-                                edited_features_count += 1
+            with arcpy.da.SearchCursor(layer, s_flds) as cur:
+                for r in cur:
+                    act_val = r[0]
+                    is_mod = len(r) > 2 and r[2] and r[3] and (r[3] - r[2]).total_seconds() > 2.0
+                    if act_val not in ('create', 'modify', 'delete') and not is_mod:
+                        continue
+                    edited_features_count += 1
+                    if not has_id or act_val == 'create':
+                        continue
+                    oid_val = str(r[1]).strip() if r[1] else ""
+                    if oid_val and not oid_val.startswith("-") and not oid_val.startswith("r"):
+                        (existing_nodes if g_type == "Point" else existing_ways).add(oid_val)
 
         if edited_features_count == 0:
             arcpy.AddWarning("No edited features found in your selection.")
             arcpy.AddMessage("Remember to change the 'osm_action' field (to 'create', 'modify', or 'delete') in the Attribute Table on the precise features you want to upload!")
             return
+
+        live_way_versions = {}
+        live_node_versions = {}
+        if existing_ways:
+            arcpy.AddMessage(f"Syncing live OpenStreetMap versions for {len(existing_ways)} existing way(s)...")
+            live_way_versions = fetch_osm_elements_versions_batch("way", existing_ways, token=active_token)
+        if existing_nodes:
+            arcpy.AddMessage(f"Syncing live OpenStreetMap versions for {len(existing_nodes)} existing node(s)...")
+            live_node_versions = fetch_osm_elements_versions_batch("node", existing_nodes, token=active_token)
 
         arcpy.AddMessage("Authenticating with standard OAuth 2.0 Bearer Token...")
         auth_header = f"Bearer {active_token}"
@@ -1496,12 +1609,21 @@ class UploadOSMData(object):
         req.add_header('Content-Type', 'text/xml')
 
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=60) as response:
                 changeset_id = response.read().decode('utf-8').strip()
             arcpy.AddMessage(f"-> Successfully opened Changeset #{changeset_id}")
         except urllib.error.URLError as e:
             arcpy.AddError(f"Failed to open Changeset: {e.read().decode('utf-8') if hasattr(e, 'read') else str(e)}")
             return
+
+        def close_changeset():
+            """Closes the changeset; called on success and on every failure path so it is never left open."""
+            try:
+                close_req = urllib.request.Request(f"{OSM_API_URL}changeset/{changeset_id}/close", method='PUT')
+                close_req.add_header('Authorization', auth_header)
+                urllib.request.urlopen(close_req, timeout=30)
+            except Exception:
+                pass
 
         topology_cache = {}
         sr_wgs84 = arcpy.SpatialReference(4326)
@@ -1521,45 +1643,6 @@ class UploadOSMData(object):
         xml_modify = []
         xml_delete = []
         negative_id_counter = -1
-
-        # Pre-scan existing elements to sync their latest live OSM versions in a single batch
-        existing_ways = set()
-        existing_nodes = set()
-        for layer in in_layers:
-            if not arcpy.Exists(layer): continue
-            desc = arcpy.Describe(layer)
-            g_type = desc.shapeType
-            all_flds = [f.name for f in arcpy.ListFields(layer)]
-            if "osm_id" in all_flds and "osm_action" in all_flds:
-                s_flds = ["osm_id", "osm_action"]
-                has_et = getattr(desc, 'editorTrackingEnabled', False)
-                c_f = getattr(desc, 'creationDateField', "")
-                e_f = getattr(desc, 'editDateField', "")
-                if has_et and c_f and e_f and c_f in all_flds and e_f in all_flds:
-                    s_flds.extend([c_f, e_f])
-                with arcpy.da.SearchCursor(layer, s_flds) as cur:
-                    for r in cur:
-                        oid_val = r[0]
-                        act_val = r[1]
-                        is_mod = False
-                        if len(r) > 2 and r[2] and r[3]:
-                            if (r[3] - r[2]).total_seconds() > 2.0:
-                                is_mod = True
-                        if oid_val and str(oid_val).strip() and not str(oid_val).strip().startswith("-"):
-                            if act_val in ['modify', 'delete'] or (is_mod and act_val != 'create'):
-                                if g_type == "Point":
-                                    existing_nodes.add(str(oid_val).strip())
-                                else:
-                                    existing_ways.add(str(oid_val).strip())
-
-        live_way_versions = {}
-        live_node_versions = {}
-        if existing_ways:
-            arcpy.AddMessage(f"Syncing live OpenStreetMap versions for {len(existing_ways)} existing way(s)...")
-            live_way_versions = fetch_osm_elements_versions_batch("way", existing_ways, token=active_token)
-        if existing_nodes:
-            arcpy.AddMessage(f"Syncing live OpenStreetMap versions for {len(existing_nodes)} existing node(s)...")
-            live_node_versions = fetch_osm_elements_versions_batch("node", existing_nodes, token=active_token)
 
         arcpy.AddMessage("Extracting geometries and translating to OSM XML...")
         feature_records = []
@@ -1635,6 +1718,10 @@ class UploadOSMData(object):
                         o_action = "create"
                     else:
                         clean_id = str(o_id).strip()
+                        if clean_id.startswith("r"):
+                            if o_action in ['create', 'modify', 'delete']:
+                                arcpy.AddWarning(f"Skipping feature OID {oid} ({clean_id}) on '{os.path.basename(layer)}': Multipolygon relations cannot be uploaded as simple ways. Please edit relation {clean_id} directly in JOSM or iD.")
+                            continue
                         elem_type = "node" if geom_type == "Point" else "way"
                         live_map = live_node_versions if elem_type == "node" else live_way_versions
                         meta = live_map.get(clean_id)
@@ -1665,21 +1752,10 @@ class UploadOSMData(object):
                         val = row[6 + idx]
                         tag_key = semantic_mapping[field_name]
                         if val is not None and str(val).strip() != "":
-                            str_val = str(val).strip()
-                            if tag_key == "addr:street":
-                                str_val = normalize_osm_street(str_val)
-                            elif tag_key == "addr:unit":
-                                str_val = normalize_osm_unit(str_val)
-                            elif tag_key == "addr:city":
-                                str_val = normalize_osm_city(str_val)
-                            elif tag_key == "addr:state":
-                                str_val = str_val.upper() if len(str_val) == 2 else normalize_osm_name(str_val)
-                            elif tag_key == "name":
-                                str_val = normalize_osm_name(str_val)
-                            tags_dict[tag_key] = str_val
+                            # Normalization is applied once below for all address/name tags
+                            tags_dict[tag_key] = str(val).strip()
                         else:
-                            if tag_key in tags_dict:
-                                del tags_dict[tag_key]
+                            tags_dict.pop(tag_key, None)
 
                     if "addr:street" in tags_dict:
                         tags_dict["addr:street"] = normalize_osm_street(tags_dict["addr:street"])
@@ -1768,6 +1844,13 @@ class UploadOSMData(object):
                         if o_action == "create": xml_create.append(way_xml)
                         elif o_action == "modify": xml_modify.append(way_xml)
 
+        total_changes = len(xml_create) + len(xml_modify) + len(xml_delete)
+        if total_changes > 10000:
+            arcpy.AddError(f"This upload contains {total_changes} OSM elements, exceeding the OSM API limit of 10,000 changes per changeset. "
+                           "Select a smaller subset of features and upload in batches.")
+            close_changeset()
+            return
+
         arcpy.AddMessage("Transmitting XML packets to the OSM API...")
         osm_change_payload = f"""<osmChange version="0.6" generator="ArcGIS Pro OSM Editor">
   <create>{"".join(xml_create)}</create>
@@ -1786,7 +1869,7 @@ class UploadOSMData(object):
             req.add_header('Content-Type', 'text/xml')
 
             try:
-                with urllib.request.urlopen(req) as response:
+                with urllib.request.urlopen(req, timeout=300) as response:
                     result = response.read().decode('utf-8')
                     if retry_count > 0:
                         arcpy.AddMessage(f"-> Edits accepted successfully by OpenStreetMap after conflict auto-resolution!")
@@ -1804,23 +1887,35 @@ class UploadOSMData(object):
                     except Exception:
                         root_elem = None
 
-                    total_updated = 0
+                    # Batch all conflicts: {(kind, id): server_version}
+                    conflict_versions = {}
                     for s_ver_str, e_kind, e_id in vm_matches:
-                        s_ver = int(s_ver_str)
-                        clean_id = str(e_id).strip()
-                        for lyr in in_layers:
-                            if arcpy.Exists(lyr):
-                                lyr_fields = [f.name for f in arcpy.ListFields(lyr)]
-                                if "osm_id" in lyr_fields and "osm_version" in lyr_fields:
-                                    with arcpy.da.UpdateCursor(lyr, ["osm_id", "osm_version"]) as ucur:
-                                        for urow in ucur:
-                                            if urow[0] and str(urow[0]).strip() == clean_id:
-                                                urow[1] = s_ver
-                                                ucur.updateRow(urow)
+                        conflict_versions[(e_kind.lower(), str(e_id).strip())] = int(s_ver_str)
 
+                    # One cursor pass per layer (instead of one full scan per conflict per layer)
+                    for lyr in in_layers:
+                        if not arcpy.Exists(lyr):
+                            continue
+                        lyr_fields = [f.name for f in arcpy.ListFields(lyr)]
+                        if "osm_id" not in lyr_fields or "osm_version" not in lyr_fields:
+                            continue
+                        lyr_kind = "node" if arcpy.Describe(lyr).shapeType == "Point" else "way"
+                        if not any(k == lyr_kind for k, _ in conflict_versions):
+                            continue
+                        with arcpy.da.UpdateCursor(lyr, ["osm_id", "osm_version"]) as ucur:
+                            for urow in ucur:
+                                key = (lyr_kind, str(urow[0]).strip()) if urow[0] else None
+                                if key in conflict_versions:
+                                    urow[1] = conflict_versions[key]
+                                    ucur.updateRow(urow)
+
+                    total_updated = 0
+                    for (kind_l, clean_id), s_ver in conflict_versions.items():
+                        e_kind = kind_l.capitalize()
                         elem_updated = 0
                         if root_elem is not None:
-                            for elem in root_elem.iter():
+                            # Restrict to the conflicting element type: node and way IDs can collide
+                            for elem in root_elem.iter(kind_l):
                                 if elem.attrib.get('id', '').strip() == clean_id:
                                     elem.set('id', clean_id)
                                     elem.set('version', str(s_ver))
@@ -1839,7 +1934,7 @@ class UploadOSMData(object):
                                 return f"{tag}>"
 
                             current_payload = re.sub(
-                                rf'(<(?:node|way|relation)\b[^>]*\bid=["\']\s*{re.escape(clean_id)}\s*["\'][^>]*)>',
+                                rf'(<{kind_l}\b[^>]*\bid=["\']\s*{re.escape(clean_id)}\s*["\'][^>]*)>',
                                 _replace_tag,
                                 current_payload
                             )
@@ -1849,6 +1944,7 @@ class UploadOSMData(object):
                         current_payload = ET.tostring(root_elem, encoding='utf-8').decode('utf-8')
                 else:
                     arcpy.AddError(f"OSM Rejected the upload due to server conflicts: {err_msg}")
+                    close_changeset()
                     return
 
         id_map = {}
@@ -1898,11 +1994,7 @@ class UploadOSMData(object):
                 arcpy.AddWarning(f"Notice: Could not update status on {os.path.basename(lyr)}: {e}")
 
         arcpy.AddMessage("Closing mapping changeset...")
-        req = urllib.request.Request(f"{OSM_API_URL}changeset/{changeset_id}/close", method='PUT')
-        req.add_header('Authorization', auth_header)
-        try:
-            urllib.request.urlopen(req)
-        except: pass
+        close_changeset()
 
         arcpy.AddMessage(f"SUCCESS! Your edits are officially live on the map: https://www.openstreetmap.org/changeset/{changeset_id}")
         return
@@ -2005,7 +2097,7 @@ class TagBuildingsFromPoints(object):
             parameterType="Optional",
             direction="Input"
         )
-        param_default_state.value = "WV"
+        param_default_state.value = ""
 
         param_postcode = arcpy.Parameter(
             displayName="Postal / Zip Code Field (addr:postcode)",
@@ -2215,7 +2307,7 @@ class TagBuildingsFromPoints(object):
         f_unit_num = parameters[5].valueAsText if parameters[5].value else None
         f_city = parameters[6].valueAsText if parameters[6].value else None
         f_state = parameters[7].valueAsText if parameters[7].value else None
-        default_state = parameters[8].valueAsText.strip() if parameters[8].value else "WV"
+        default_state = parameters[8].valueAsText.strip() if parameters[8].value else ""
         f_postcode = parameters[9].valueAsText if parameters[9].value else None
         f_full_address = parameters[10].valueAsText if parameters[10].value else None
 
@@ -2298,6 +2390,8 @@ class TagBuildingsFromPoints(object):
                 add_pt_field("addr_postcode", "TEXT", 20)
                 add_pt_field("addr_full", "TEXT", 255)
 
+        field_cache = {}
+
         def resolve_layer_field(layer, requested_name):
             if not requested_name or not layer:
                 return None
@@ -2305,7 +2399,9 @@ class TagBuildingsFromPoints(object):
             if "." in req_clean:
                 req_clean = req_clean.split(".")[-1]
             try:
-                fields = arcpy.ListFields(layer)
+                if layer not in field_cache:
+                    field_cache[layer] = arcpy.ListFields(layer)
+                fields = field_cache[layer]
                 for f in fields:
                     if f.name == req_clean or f.name == requested_name:
                         return f.name
@@ -2331,6 +2427,16 @@ class TagBuildingsFromPoints(object):
         # Determine cell size for spatial hash grid index
         is_geographic = getattr(sr_buildings, 'type', '') == "Geographic"
         grid_cell_size = 0.001 if is_geographic else 150.0 # ~110m or 150ft/m
+
+        # Convert meter-based tolerances into the buildings' native map units (degrees, feet, or meters)
+        if is_geographic:
+            meters_per_unit = 111320.0
+        else:
+            meters_per_unit = getattr(sr_buildings, 'metersPerUnit', 1.0) or 1.0
+        search_tol = search_dist / meters_per_unit
+        suite_match_tol = 1.0 / meters_per_unit
+        dedup_window = 5.0 / meters_per_unit
+        dedup_tol = 2.0 / meters_per_unit
 
         # 1. Load Address Points into Fast Spatial Hash Grid
         addr_grid = SpatialHashGrid(grid_cell_size)
@@ -2388,7 +2494,7 @@ class TagBuildingsFromPoints(object):
             finally:
                 if arcpy.Exists(temp_addr_fl):
                     try: arcpy.management.Delete(temp_addr_fl)
-                    except: pass
+                    except Exception: pass
 
             arcpy.AddMessage(f"-> Indexed {total_addr_loaded} address point(s) into memory spatial hash grid.")
 
@@ -2423,7 +2529,7 @@ class TagBuildingsFromPoints(object):
             finally:
                 if arcpy.Exists(temp_name_fl):
                     try: arcpy.management.Delete(temp_name_fl)
-                    except: pass
+                    except Exception: pass
 
             arcpy.AddMessage(f"-> Indexed {total_names_loaded} common name point(s) into memory spatial hash grid.")
 
@@ -2462,7 +2568,7 @@ class TagBuildingsFromPoints(object):
                     continue
 
                 poly_ext = poly_geom.extent
-                buf = search_dist if search_dist > 0.0 else 0.0
+                buf = search_tol if search_tol > 0.0 else 0.0
 
                 # Query Spatial Hash Grid for points strictly inside envelope + search buffer
                 candidate_addrs = addr_grid.query_envelope(
@@ -2478,16 +2584,13 @@ class TagBuildingsFromPoints(object):
                 matched_addr_list = []
                 matched_name_list = []
 
+                # distanceTo() returns 0 for points inside/on the polygon, so one call covers contains+touches+buffer
                 for pt_geom, data in candidate_addrs:
-                    if poly_geom.contains(pt_geom) or poly_geom.touches(pt_geom):
-                        matched_addr_list.append((pt_geom, data))
-                    elif search_dist > 0.0 and poly_geom.distanceTo(pt_geom) <= search_dist:
+                    if poly_geom.distanceTo(pt_geom) <= search_tol:
                         matched_addr_list.append((pt_geom, data))
 
                 for pt_geom, name_str in candidate_names:
-                    if poly_geom.contains(pt_geom) or poly_geom.touches(pt_geom):
-                        matched_name_list.append((pt_geom, name_str))
-                    elif search_dist > 0.0 and poly_geom.distanceTo(pt_geom) <= search_dist:
+                    if poly_geom.distanceTo(pt_geom) <= search_tol:
                         matched_name_list.append((pt_geom, name_str))
 
                 if not matched_addr_list and not matched_name_list:
@@ -2526,7 +2629,7 @@ class TagBuildingsFromPoints(object):
 
                                 suite_name = ""
                                 if matched_name_list:
-                                    min_d = 1.0
+                                    min_d = suite_match_tol
                                     for n_geom, n_str in matched_name_list:
                                         d = pt_geom.distanceTo(n_geom)
                                         if d <= min_d:
@@ -2556,7 +2659,7 @@ class TagBuildingsFromPoints(object):
                                 pt_osm_id = addr_item.get("osm_id", "").strip()
                                 pt_osm_ver_raw = addr_item.get("osm_version", 1)
                                 try: pt_osm_ver = int(pt_osm_ver_raw)
-                                except: pt_osm_ver = 1
+                                except (TypeError, ValueError): pt_osm_ver = 1
 
                                 multiunit_points_to_insert.append([
                                     pt_geom, pt_osm_id, suite_name[:254], "node", json.dumps(pt_node_tags), pt_osm_ver, "create",
@@ -2657,7 +2760,7 @@ class TagBuildingsFromPoints(object):
             finally:
                 if arcpy.Exists(temp_fl_dedup):
                     try: arcpy.management.Delete(temp_fl_dedup)
-                    except: pass
+                    except Exception: pass
 
             points_to_insert = []
             points_to_update = {} # OID -> pt_row_data
@@ -2684,10 +2787,10 @@ class TagBuildingsFromPoints(object):
                 if not matched_oid and p_geom:
                     p_pt = p_geom.firstPoint if hasattr(p_geom, 'firstPoint') else p_geom
                     spatial_candidates = existing_spatial_grid.query_envelope(
-                        p_pt.X - 5.0, p_pt.Y - 5.0, p_pt.X + 5.0, p_pt.Y + 5.0
+                        p_pt.X - dedup_window, p_pt.Y - dedup_window, p_pt.X + dedup_window, p_pt.Y + dedup_window
                     )
                     for ex_geom, (ex_oid, ex_hn, ex_st, ex_un) in spatial_candidates:
-                        if p_geom.distanceTo(ex_geom) <= 2.0:
+                        if p_geom.distanceTo(ex_geom) <= dedup_tol:
                             if p_hn_l == ex_hn and p_st_l == ex_st and (not p_un_l or p_un_l == ex_un):
                                 matched_oid = ex_oid
                                 break
