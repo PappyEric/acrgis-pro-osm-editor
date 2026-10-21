@@ -9,7 +9,7 @@ If you've been around GIS for a while, you know the old ArcObjects OSM plugins w
 You get four tools:
 
 1. **Download OSM Data To Current View**: Grabs whatever's in your active map extent. It rips the JSON apart, dumps it cleanly into native Points, Lines, and Polygons, and builds a hidden topology node backbone so things actually snap together properly.
-2. **Download OSM Cemeteries by County**: (This is a niche tool for a cememtery location project)Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`, `cemetery=*`, `historic=cemetery`). Operates as a pure, lightweight reference layer with clean dataset overwriting, live OSM user/timestamp attribution, multi-endpoint Overpass failover with bounding box fallback, and identifier filters (Wikidata / Find A Grave).
+2. **Download OSM Cemeteries by County**: (This is a niche tool for a cememtery location project) Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`, `cemetery=*`, `historic=cemetery`). Operates as a pure, lightweight reference layer with clean dataset overwriting, live OSM user/timestamp attribution, multi-endpoint Overpass failover with bounding box fallback, and identifier filters (Wikidata / Find A Grave).
 3. **Tag OSM Buildings from Address & Name Points**: Performs an in-memory point-in-polygon spatial join between your GIS address / structure name points and the OSM building footprint polygons. Maps addresses into standard OSM `addr:*` tags and structure names into `name`, ready for upload.
 4. **Upload Edits to OSM**: Scans your local edits, converts them back to `osmChange` XML packets, and pushes them to your OSM account.
 
@@ -79,10 +79,12 @@ ArcGIS and OSM handle lines completely differently. Pro uses independent geograp
 We built a backend topology cache that tries to snap your new vertices into the existing OSM node network, but **if you heavily rip apart pre-existing roads, you're going to leave orphaned nodes floating around the server.**
 
 **The Golden Rules:**
-✅ **Good for:** Mass attribute tagging (fixing speed limits, trail names) via the Attribute table.
-✅ **Good for:** Drawing hundreds of brand new buildings or POIs from scratch.
-✅ **Good for:** Enriching building footprints with authoritative local address and name points.
-✅ **Good for:** Pulling 100% fresh, authoritative county cemetery reference layers with live mapper attribution.
-✅ **Good for:** Straight-up deleting bad features.
-❌ **Avoid:** Bulldozing or doing heavy geometric realignment of massive, interconnected highways. If you're doing complex road networking, boot up JOSM so you don't crater the topological network.
-❌ **Note:** The Cemetery tool is strictly a reference/audit layer; it does not build topology nodes and is not intended for pushing geometry edits back via `UploadOSMData`.
+
+- ✅ **Good for:** Mass attribute tagging (fixing speed limits, trail names) via the Attribute table.
+- ✅ **Good for:** Drawing hundreds of brand new buildings or POIs from scratch.
+- ✅ **Good for:** Enriching building footprints with authoritative local address and name points.
+- ✅ **Good for:** Pulling 100% fresh, authoritative county cemetery reference layers with live mapper attribution.
+- ✅ **Good for:** Straight-up deleting bad features.
+- ❌ **Avoid:** Bulldozing or doing heavy geometric realignment of massive, interconnected highways. If you're doing complex road networking, boot up JOSM so you don't crater the topological network.
+- ❌ **Note:** The Cemetery tool is strictly a reference/audit layer; it does not build topology nodes and is not intended for pushing geometry edits back via `UploadOSMData`.
+
