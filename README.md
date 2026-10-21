@@ -7,18 +7,53 @@ If you've been around GIS for a while, you know the old ArcObjects OSM plugins w
 You get four tools:
 
 1. **Download OSM Data To Current View**: Grabs whatever's in your active map extent. It rips the JSON apart, dumps it cleanly into native Points, Lines, and Polygons, and builds a hidden topology node backbone so things actually snap together properly.
-2. **Download OSM Cemeteries by County**: (This is a niche tool for a cememtery location project) Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`, `cemetery=*`, `historic=cemetery`). Operates as a pure, lightweight reference layer with clean dataset overwriting, live OSM user/timestamp attribution, multi-endpoint Overpass failover with bounding box fallback, and identifier filters (Wikidata / Find A Grave).
+2. **Download OSM Cemeteries by County**: *(Niche tool for a cemetery location project)* Dedicated county-scale cemetery extractor (`landuse=cemetery`, `amenity=grave_yard`, `cemetery=*`, `historic=cemetery`). Operates as a pure, lightweight reference layer with clean dataset overwriting, live OSM user/timestamp attribution, multi-endpoint Overpass failover with bounding box fallback, and identifier filters (Wikidata / Find A Grave).
 3. **Tag OSM Buildings from Address & Name Points**: Performs an in-memory point-in-polygon spatial join between your GIS address / structure name points and the OSM building footprint polygons. Maps addresses into standard OSM `addr:*` tags and structure names into `name`, ready for upload.
 4. **Upload Edits to OSM**: Scans your local edits, converts them back to `osmChange` XML packets, and pushes them to your OSM account.
 
-## Setup & Auth (Don't Skip This)
+## Installation & Adding to ArcGIS Pro
 
-OSM requires strict OAuth 2.0 Personal Access Tokens now.
+### 1. Download & Placement
+1. Click the green **Code** button on GitHub and select **Download ZIP** (or clone via `git clone https://github.com/PappyEric/acrgis-pro-osm-editor.git`).
+2. Extract the folder to a stable location on your drive (e.g., `C:\GIS\Tools\acrgis-pro-osm-editor` or inside your project workspace).
 
-1. Head over to your [OSM Account Settings](https://www.openstreetmap.org/user/-/oauth2_applications) -> **OAuth 2 Applications**.
-2. Register a new app (Uncheck "Confidential Application") and check the box for `Modify the map`.
-3. Run the `get_osm_token.py` script we included to get your permanent Bearer Token.
-4. Hardcode that token into the `OSM_BEARER_TOKEN` variable at the very top of `OSM_Editor.pyt`. _(Note: Don't push this token to a public GitHub repo unless you want script-kiddies nuking the map under your name)._
+### 2. Connect the Toolbox in ArcGIS Pro
+1. Open your project in **ArcGIS Pro**.
+2. Open the **Catalog Pane** (**View** tab &rarr; **Catalog Pane**, or press `Ctrl + Alt + G`).
+3. In the Catalog tree:
+   - **Method A (Add to current project):** Right-click **Toolboxes** &rarr; select **Add Toolbox**. Browse to the extracted folder, select **`OSM_Editor.pyt`**, and click **OK**.
+   - **Method B (Folder connection):** Right-click **Folders** &rarr; select **Add Folder Connection**, select the repository folder, and expand it to see `OSM_Editor.pyt`.
+4. *(Recommended)* **Add to Favorites:** Right-click **`OSM_Editor.pyt`** in the Catalog pane and click **Add To Favorites**. Then right-click it under Favorites and check **Add To New Projects** so it is permanently available in every ArcGIS Pro project you create.
+
+### 3. Where to Find and Run the Tools
+Once added, you can access the tools from two places:
+- **Catalog Pane:** Expand **Toolboxes** &rarr; **ArcGIS Pro OSM Editor** (`OSM_Editor.pyt`).
+- **Geoprocessing Pane:** Go to the **Analysis** tab &rarr; click **Tools** (to open Geoprocessing) &rarr; switch to the **Toolboxes** tab &rarr; find **ArcGIS Pro OSM Editor**.
+
+Inside you will find all four tools ready to run:
+- **Download OSM Data To Current View**
+- **Download OSM Cemeteries by County**
+- **Tag OSM Buildings from Address & Name Points**
+- **Upload Edits to OSM**
+
+---
+
+## Setup & Authentication (For Uploading Edits)
+
+Downloading and spatial tagging work immediately with zero setup. If you plan to **upload edits back to OpenStreetMap**, OSM requires OAuth 2.0 authentication:
+
+1. Log in to OpenStreetMap and go to [My Settings &rarr; OAuth 2 Applications &rarr; Register new application](https://www.openstreetmap.org/user/-/oauth2_applications).
+2. Set **Name** to `ArcGIS Pro OSM Editor`.
+3. Set **Redirect URIs** to `urn:ietf:wg:oauth:2.0:oob`.
+4. **Uncheck** *"Confidential application"*, and check the box for permissions: **Modify the map** (`write_api`).
+5. Click **Register**, then copy your generated **Client ID**.
+6. Open a terminal or command prompt in the repository folder and run:
+   ```bash
+   python get_osm_token.py
+   ```
+   Paste your Client ID, authorize in the browser that opens, and paste the authorization code. The script automatically saves your permanent Bearer Token into a local `osm_token.txt` file (which is git-ignored).
+7. The toolbox automatically detects `osm_token.txt`. You are ready to upload! *(Alternatively, you can paste the token directly into the tool parameter when running Upload Edits to OSM, or set the `OSM_BEARER_TOKEN` environment variable).*
+
 
 ## Editing & Reference Workflows
 
